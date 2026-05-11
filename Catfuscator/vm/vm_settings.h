@@ -27,6 +27,8 @@ struct vm_settings {
 	// Control flow
 	bool control_flow_flattening = true;
 	bool context_dependent_decoding = false;
+	bool fake_cfg_edges = false;  // Insert unreachable conditional jumps in bytecode
+	int fake_edge_pct = 10;      // Chance to add fake edge per block
 
 	static vm_settings from_profile(vm_profile profile) {
 		vm_settings s;
@@ -60,6 +62,8 @@ struct vm_settings {
 			s.per_region_register_rename = true;
 			s.control_flow_flattening = true;
 			s.context_dependent_decoding = true;
+			s.fake_cfg_edges = true;
+			s.fake_edge_pct = 15;
 			break;
 		}
 		return s;

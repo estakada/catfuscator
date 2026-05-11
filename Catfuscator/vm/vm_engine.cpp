@@ -430,6 +430,7 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 		// Apply CFF to inner bytecode
 		if (settings.control_flow_flattening) {
 			vm_cff inner_cff(inner_table, seed_value ^ 0x12345678);
+			inner_cff.set_fake_cfg_edges(settings.fake_cfg_edges, settings.fake_edge_pct);
 			inner_cff.flatten(inner_bytecode);
 		}
 
@@ -751,6 +752,7 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 
 	if (settings.control_flow_flattening) {
 		vm_cff cff(opcode_table, seed_value);
+		cff.set_fake_cfg_edges(settings.fake_cfg_edges, settings.fake_edge_pct);
 		if (!cff.flatten(bytecode)) {
 			printf("[vm_engine] failed to flatten CFG\n");
 			return false;

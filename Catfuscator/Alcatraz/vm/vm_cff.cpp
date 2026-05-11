@@ -475,13 +475,6 @@ bool vm_cff::flatten(std::vector<uint8_t>& bytecode) {
 
 	uint16_t jmp_opcode = table.encode(vm_op::VM_JMP);
 
-	struct output_block {
-		std::vector<uint8_t> code;
-		// Patches: offset within this block's code → target block id
-		struct patch { uint32_t offset; int target_block; };
-		std::vector<patch> patches;
-	};
-
 	std::vector<output_block> out_blocks(blocks.size());
 
 	for (int i = 0; i < static_cast<int>(blocks.size()); i++) {
@@ -554,4 +547,51 @@ bool vm_cff::flatten(std::vector<uint8_t>& bytecode) {
 		blocks.size(), bytecode.size(), result.size());
 	bytecode = std::move(result);
 	return true;
+}
+
+void vm_cff::inject_fake_cfg_edges(std::vector<uint8_t>& bytecode, const std::vector<int>& block_position,
+	const std::vector<uint32_t>& block_offsets, const std::vector<output_block>& out_blocks,
+	const std::vector<int>& order, size_t block_count) {
+
+	if (block_count < 2) return;
+
+	uint32_t pos = 0;
+	for (size_t i = 0; i < block_count; i++) {
+		uint32_t block_size = static_cast<uint32_t>(out_blocks[i].code.size());
+		if (block_size == 0) {
+			pos += block_size;
+			continue;
+		}
+
+		if (rng() % 100 < fake_edge_pct) {
+			int target_block = rng() % block_count;
+			uint16_t test_op = table.encode(vm_op::VM_TEST_REG_IMM);
+			uint16_t jz_op = table.encode(vm_op::VM_JZ);
+			uint8_t vreg = static_cast<uint8_t>(rng() % 16);
+
+			uint8_t fake_data[8] = {
+				static_cast<uint8_t>(test_op & 0xFF), static_cast<uint8_t>((test_op >> 8) & 0xFF),
+				vreg, 1, 0, 0, 0, 8
+			};
+
+			uint32_t target_abs = block_offsets[target_block];
+			uint32_t jz_offset_pos = pos + block_size + 2 + 4;
+			uint32_t jz_abs = jz_offset_pos + 4;
+			int32_t rel = static_cast<int32_t>(target_abs) - static_cast<int32_t>(jz_abs);
+
+			uint8_t jz_data[6] = {
+				static_cast<uint8_t>(jz_op & 0xFF), static_cast<uint8_t>((jz_op >> 8) & 0xFF),
+				static_cast<uint8_t>(rel & 0xFF),
+				static_cast<uint8_t>((rel >> 8) & 0xFF),
+				static_cast<uint8_t>((rel >> 16) & 0xFF),
+				static_cast<uint8_t>((rel >> 24) & 0xFF)
+			};
+
+			auto it = bytecode.begin() + pos + block_size;
+			bytecode.insert(it, fake_data, fake_data + 8);
+			bytecode.insert(bytecode.begin() + pos + block_size + 8, jz_data, jz_data + 6);
+		}
+
+		pos += block_size;
+	}
 }
