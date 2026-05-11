@@ -30,6 +30,10 @@ struct vm_settings {
 	bool fake_cfg_edges = false;  // Insert unreachable conditional jumps in bytecode
 	int fake_edge_pct = 10;      // Chance to add fake edge per block
 
+	// Self-modifying bytecode: periodically re-XOR bytecode in memory
+	bool self_modifying_bytecode = false;
+	int self_modify_interval = 16;  // Re-XOR every N instructions
+
 	static vm_settings from_profile(vm_profile profile) {
 		vm_settings s;
 		switch (profile) {
@@ -64,6 +68,8 @@ struct vm_settings {
 			s.context_dependent_decoding = true;
 			s.fake_cfg_edges = true;
 			s.fake_edge_pct = 15;
+			s.self_modifying_bytecode = true;
+			s.self_modify_interval = 16;
 			break;
 		}
 		return s;

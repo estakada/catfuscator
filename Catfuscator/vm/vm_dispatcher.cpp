@@ -449,6 +449,60 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 
 	a.bind(labels.dispatch_continue);
 
+	// Self-modifying bytecode: every N instructions, re-XOR the bytecode region
+	if (settings && settings->self_modifying_bytecode) {
+		int interval = (settings && settings->self_modify_interval > 0) ? settings->self_modify_interval : 16;
+		Label skip_mod = a.newLabel();
+		Label mod_loop = a.newLabel();
+		Label mod_done = a.newLabel();
+		Label key_done = a.newLabel();
+
+		// Increment instruction counter in VM register file
+		a.inc(dword_ptr(rbx, VRFLAGS_OFF));
+
+		// Check if counter >= interval
+		a.cmp(dword_ptr(rbx, VRFLAGS_OFF), Imm(interval));
+		a.jl(skip_mod);
+
+		// Reset counter
+		a.mov(dword_ptr(rbx, VRFLAGS_OFF), Imm(0));
+
+		// Generate new XOR key: new_key = rdrand() ^ old_key (R12)
+		Label l_rax = a.newLabel();
+		a.bind(l_rax);
+		a.rdrand(eax);
+		a.jnc(l_rax); // retry if CF=0
+		a.xor_(eax, r12d); // R12 = current XOR key
+		// R12 = new key
+		a.mov(r12d, eax);
+
+		// Re-XOR bytecode: for i in [0, bytecode_size): bc[R13+i] ^= R12b rotated
+		a.mov(esi, 0);           // i = 0 (RSI already incremented by decode)
+		a.mov(r10d, 0);         // key_byte_idx = 0
+		a.mov(ecx, Imm(bytecode_size_for_checksum));
+
+		a.bind(mod_loop);
+		a.test(ecx, ecx);
+		a.jz(mod_done);
+		a.mov(r10b, byte_ptr(r13, rsi));
+		a.xor_(r10b, r12b);       // XOR with low byte of key
+		a.mov(byte_ptr(r13, rsi), r10b);
+		a.inc(esi);
+		a.inc(r10d);
+		a.cmp(r10d, 4);
+		a.jb(key_done);
+		a.mov(r10d, 0);          // reset key_byte_idx
+		a.ror(r12d, 8);          // rotate key for next byte
+		a.bind(key_done);
+		a.dec(ecx);
+		a.jmp(mod_loop);
+
+		a.bind(mod_done);
+		// R12 now holds new XOR key for next decode cycle
+		// Continue dispatch (bytecode already re-XORed)
+		a.bind(skip_mod);
+	}
+
 	// Build dispatch entries: original + dup handlers
 	struct dispatch_entry { uint16_t encoded; Label* target; };
 	std::vector<dispatch_entry> entries;
