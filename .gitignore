@@ -1,0 +1,56 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.rsuser
+*.tlog
+*.lastbuildstate
+
+# Build outputs
+x64/
+Win32/
+/Catfuscator-gui/x64/
+/Catfuscator/x64/
+/Catfuscator/build_tmp/
+/Catfuscator/extern/asmjit/build/
+/Catfuscator/extern/zydis/build/
+/Catfuscator/extern/zydis/dependencies/zycore/build/
+/Catfuscator/Catfuscator.sln
+
+# Test outputs
+test/*.exe
+test/*.obj
+test/*.ilk
+test/*.pdb
+test/*.obf.exe
+test/*.obf.pdb
+test/objs/
+test/*.id0
+test/*.id1
+test/*.id2
+test/*.iobj
+test/*.ipdb
+test/*.idb
+test/*.nam
+
+# Generated/locked files
+*.log
+*.exp
+*.lib
+*.manifest
+*_compile.bat
+*.asm.obj
+
+# Git
+.gitmodules
+
+# Build scripts (generated)
+build.ps1
+asm_build.ps1
+/build_tmp
+*.exe
+*.obj
+*.ilk
+*.pdb
+/Catfuscator/extern
+/Catfuscator/images
