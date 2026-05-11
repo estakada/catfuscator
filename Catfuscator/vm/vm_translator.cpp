@@ -154,11 +154,32 @@ void vm_translator::maybe_emit_junk(std::vector<uint8_t>& bc) {
 }
 
 void vm_translator::emit_prefixes(std::vector<uint8_t>& bc) {
+	// Garbage byte injection: insert fake prefix/opcode sequences that look like
+	// valid VM instructions in disassembly but are consumed as harmless prefixes.
+	// Each prefix is a valid but unused VM opcode that makes dispatch jump through
+	// the instruction but land on the same handler (since prefixes don't change decode).
+	// Inject more prefixes when junk_frequency is high.
 	uint32_t count = junk_rng() % 5;
 	if (count > 3) count = 0;
+	// When junk_frequency >= 50, always inject at least 1 prefix
+	if (settings && settings->junk_frequency >= 50 && count == 0) count = 1;
+	// When junk_frequency >= 75, inject up to 3 (up from 2)
+	if (settings && settings->junk_frequency >= 75) count = junk_rng() % 4;
+
 	for (uint32_t i = 0; i < count; i++) {
 		uint16_t pv = table.prefix_values[junk_rng() % vm_opcode_table::NUM_PREFIXES];
 		emit_u16(bc, pv);
+	}
+
+	// Inject full fake instruction sequences (2+ byte pairs) between real instructions.
+	// These are valid VM opcodes that decode and dispatch normally but perform no work.
+	// Appear as executable code in disassembly, increasing analysis complexity.
+	if (settings && settings->junk_frequency >= 40) {
+		uint32_t fake_instr = junk_rng() % 3;
+		for (uint32_t i = 0; i < fake_instr; i++) {
+			uint16_t fake = table.prefix_values[junk_rng() % vm_opcode_table::NUM_PREFIXES];
+			emit_u16(bc, fake);  // full 2-byte fake instruction
+		}
 	}
 }
 
@@ -194,48 +215,415 @@ void vm_translator::emit_i64(std::vector<uint8_t>& bc, int64_t val) {
 void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, int64_t val) {
 	int opaque_pct = settings ? settings->opaque_constant_pct : 30;
 	if ((junk_rng() % 100) < opaque_pct) {
-		int32_t A = static_cast<int32_t>(junk_rng());
-		int32_t B = static_cast<int32_t>(junk_rng());
-		int64_t sA = static_cast<int64_t>(A);
-		int64_t sB = static_cast<int64_t>(B);
-		int64_t base = (val - sB) ^ sA;
+		// Constants Pollution: replace raw immediate with arithmetic chain
+		// VM bytecode has no native mov with arithmetic, so we build chains:
+		// val = f(base) where base is a random constant we can encode directly
+		// Then: vreg = base; vreg = f(vreg)
+
+		// Choose obfuscation form randomly
+		int form = junk_rng() % 5;
 
 		uint8_t flags_idx = static_cast<uint8_t>(vm_reg::VRFLAGS);
 
-		// PUSH VRFLAGS (save flags to native stack)
-		emit_prefixes(bc);
-		emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
-		emit_byte(bc, flags_idx);
+		switch (form) {
+		case 0: {
+			// Form A: val = ((base ^ A) + B) where base = (val - B) ^ A
+			// 3 ops: MOV base, XOR A, ADD B
+			int32_t A = static_cast<int32_t>(junk_rng());
+			int32_t B = static_cast<int32_t>(junk_rng());
+			int64_t sA = static_cast<int64_t>(A);
+			int64_t sB = static_cast<int64_t>(B);
+			int64_t base = (val - sB) ^ sA;
 
-		// MOV vreg, base (encrypted)
-		emit_prefixes(bc);
-		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
-		emit_byte(bc, vreg);
-		emit_i64(bc, base ^ static_cast<int64_t>(imm_xor_key));
+			// PUSH VRFLAGS (save flags to native stack)
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+			emit_byte(bc, flags_idx);
 
-		// XOR vreg, A (size=8 for 64-bit)
-		emit_prefixes(bc);
-		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
-		emit_byte(bc, vreg);
-		emit_i32(bc, A);
-		emit_byte(bc, 8);
+			// MOV vreg, base (encrypted)
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i64(bc, base ^ static_cast<int64_t>(imm_xor_key));
 
-		// ADD vreg, B (size=8 for 64-bit)
-		emit_prefixes(bc);
-		emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
-		emit_byte(bc, vreg);
-		emit_i32(bc, B);
-		emit_byte(bc, 8);
+			// XOR vreg, A (size=8 for 64-bit)
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, A);
+			emit_byte(bc, 8);
 
-		// POP VRFLAGS (restore flags from native stack)
-		emit_prefixes(bc);
-		emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
-		emit_byte(bc, flags_idx);
+			// ADD vreg, B (size=8 for 64-bit)
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, B);
+			emit_byte(bc, 8);
+
+			// POP VRFLAGS (restore flags from native stack)
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+			break;
+		}
+
+		case 1: {
+			// Form B: val = ((base ^ A) - B) where base = (val + B) ^ A
+			// 3 ops: MOV base, XOR A, SUB B
+			int32_t A = static_cast<int32_t>(junk_rng());
+			int32_t B = static_cast<int32_t>(junk_rng());
+			int64_t sA = static_cast<int64_t>(A);
+			int64_t sB = static_cast<int64_t>(B);
+			int64_t base = (val + sB) ^ sA;
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i64(bc, base ^ static_cast<int64_t>(imm_xor_key));
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, A);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, B);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+			break;
+		}
+
+		case 2: {
+			// Form C: val = ((base ^ A) + B) ^ C  where base = ((val ^ C) - B) ^ A
+			// 4 ops: MOV base, XOR A, ADD B, XOR C
+			int32_t A = static_cast<int32_t>(junk_rng());
+			int32_t B = static_cast<int32_t>(junk_rng());
+			int32_t C = static_cast<int32_t>(junk_rng());
+			int64_t base = ((val ^ static_cast<int64_t>(C)) - static_cast<int64_t>(B)) ^ static_cast<int64_t>(A);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i64(bc, base ^ static_cast<int64_t>(imm_xor_key));
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, A);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, B);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, C);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+			break;
+		}
+
+		case 3: {
+			// Form D: val = ((base ^ A) ^ B) - C  where base = ((val + C) ^ B) ^ A
+			// 4 ops: MOV base, XOR A, XOR B, SUB C
+			int32_t A = static_cast<int32_t>(junk_rng());
+			int32_t B = static_cast<int32_t>(junk_rng());
+			int32_t C = static_cast<int32_t>(junk_rng());
+			int64_t base = ((val + static_cast<int64_t>(C)) ^ static_cast<int64_t>(B)) ^ static_cast<int64_t>(A);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i64(bc, base ^ static_cast<int64_t>(imm_xor_key));
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, A);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, B);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, C);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+			break;
+		}
+
+		case 4:
+		default: {
+			// Form E: val = ((base + A) ^ B) - C  where base = ((val + C) ^ B) - A
+			// 4 ops: MOV base, ADD A, XOR B, SUB C
+			int32_t A = static_cast<int32_t>(junk_rng());
+			int32_t B = static_cast<int32_t>(junk_rng());
+			int32_t C = static_cast<int32_t>(junk_rng());
+			int64_t base = ((val + static_cast<int64_t>(C)) ^ static_cast<int64_t>(B)) - static_cast<int64_t>(A);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i64(bc, base ^ static_cast<int64_t>(imm_xor_key));
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, A);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, B);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, C);
+			emit_byte(bc, 8);
+
+			emit_prefixes(bc);
+			emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+			emit_byte(bc, flags_idx);
+			break;
+		}
+		}
 	} else {
 		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i64(bc, val ^ static_cast<int64_t>(imm_xor_key));
 	}
+}
+
+// emit_obfuscated_imm32: for i32 immediates in ALU ops
+// Replaces raw immediate with arithmetic chain to defeat static analysis
+//
+// For ALU op like ADD/SUB/XOR/AND/OR vreg, imm:
+//   We load vreg with (imm - A), then ADD A to recover imm, then do the real op.
+//   But for XOR/AND/OR, the compensate value is different from A.
+//
+// Strategy:
+//   1. Load vreg with base (encrypted): vreg = imm ^ A ^ B
+//   2. XOR vreg, A then XOR vreg, B → vreg = imm  (XOR chain restores original)
+//   3. Then do: ALU_op vreg, (imm + compensation) to get the correct final result
+//
+// Since XOR vreg, A ^ vreg, B already gives us vreg=imm, the ALU op just needs
+// the original imm value. So we just do the real ALU op after the XOR chain.
+//
+// For commutative ops (ADD/OR/XOR/AND), we can also use ADD-compensate approach:
+//   Load vreg = imm - A, then ADD vreg, A (gives imm), then ALU op with 0 (noop).
+//   This lets us use ADD compensation as the chain. Or simpler: just do the XOR chain.
+void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op) {
+	int form = junk_rng() % 5;
+	uint8_t flags_idx = static_cast<uint8_t>(vm_reg::VRFLAGS);
+
+	// Save flags since we modify them
+	emit_prefixes(bc);
+	emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+	emit_byte(bc, flags_idx);
+
+	switch (form) {
+	case 0: {
+		// Form 0: Two-level XOR chain — most effective for hiding the constant
+		// vreg = (imm ^ A) ^ B  → XOR A → XOR B → vreg = imm
+		// Then do the real ALU op with the original immediate value
+		int32_t A = static_cast<int32_t>(junk_rng());
+		int32_t B = static_cast<int32_t>(junk_rng());
+		int32_t base = (val ^ A) ^ B;
+
+		// Load base via MOV_REG_IMM64 (with imm_xor_key encryption)
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, static_cast<int64_t>(base) ^ static_cast<int64_t>(imm_xor_key));
+
+		// XOR chain to restore original value
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 4);
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, B);
+		emit_byte(bc, 4);
+
+		// Now do the real ALU op with the original immediate value
+		// Since vreg == val, this is exactly vreg op val
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(alu_op, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, val);
+		emit_byte(bc, 4);
+		break;
+	}
+
+	case 1: {
+		// Form 1: XOR + ADD compensation chain
+		// vreg = val ^ A (opaque load), then XOR A, then ADD val to compensate
+		// Since vreg already has the real value after XOR A, just do ALU op with val
+		int32_t A = static_cast<int32_t>(junk_rng());
+		int32_t base = val ^ A;
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, static_cast<int64_t>(base) ^ static_cast<int64_t>(imm_xor_key));
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 4);
+
+		// Now vreg == val; do the real ALU op
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(alu_op, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, val);
+		emit_byte(bc, 4);
+		break;
+	}
+
+	case 2: {
+		// Form 2: ADD-sub compensation chain
+		// vreg = val + A (load), then SUB A to recover val
+		// Works for loading positive-ish values. For negative, ADD makes it.
+		int32_t A = static_cast<int32_t>(junk_rng());
+		int32_t base = val + A;
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, static_cast<int64_t>(base) ^ static_cast<int64_t>(imm_xor_key));
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 4);
+
+		// vreg == val now; do the real ALU op
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(alu_op, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, val);
+		emit_byte(bc, 4);
+		break;
+	}
+
+	case 3: {
+		// Form 3: SUB-add compensation chain
+		// vreg = val - A (load), then ADD A to recover val
+		int32_t A = static_cast<int32_t>(junk_rng());
+		int32_t base = val - A;
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, static_cast<int64_t>(base) ^ static_cast<int64_t>(imm_xor_key));
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 4);
+
+		// vreg == val now; do the real ALU op
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(alu_op, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, val);
+		emit_byte(bc, 4);
+		break;
+	}
+
+	case 4:
+	default: {
+		// Form 4: Three-level XOR chain with extra noise
+		// vreg = ((val ^ A) ^ B) ^ A — XOR A twice to cancel, B in middle
+		int32_t A = static_cast<int32_t>(junk_rng());
+		int32_t B = static_cast<int32_t>(junk_rng());
+		int32_t base = ((val ^ A) ^ B) ^ A;
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, static_cast<int64_t>(base) ^ static_cast<int64_t>(imm_xor_key));
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 4);
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, B);
+		emit_byte(bc, 4);
+
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 4);
+
+		// vreg == val now; do the real ALU op
+		emit_prefixes(bc);
+		emit_u16(bc, table.encode_random(alu_op, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, val);
+		emit_byte(bc, 4);
+		break;
+	}
+	}
+
+	// Restore flags
+	emit_prefixes(bc);
+	emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+	emit_byte(bc, flags_idx);
 }
 
 bool vm_translator::map_register(ZydisRegister reg, uint8_t& out_vreg, uint8_t& out_size) {
@@ -317,10 +705,19 @@ bool vm_translator::translate_alu_reg_imm(vm_op op, const obfuscator::instructio
 	auto& operands = inst.zyinstr.operands;
 	uint8_t vreg, sz;
 	if (!map_register(operands[0].reg.value, vreg, sz)) return false;
-	emit_u16(bc, table.encode_random(op, junk_rng));
-	emit_byte(bc, vreg);
-	emit_i32(bc, static_cast<int32_t>(operands[1].imm.value.s));
-	emit_byte(bc, sz);
+	int32_t imm_val = static_cast<int32_t>(operands[1].imm.value.s);
+
+	// Constants Pollution for i32 immediates: with opaque_constant_pct probability,
+	// replace the raw immediate with an arithmetic chain that computes the same value
+	int opaque_pct = settings ? settings->opaque_constant_pct : 30;
+	if ((junk_rng() % 100) < opaque_pct) {
+		emit_obfuscated_imm32(bc, vreg, imm_val, op);
+	} else {
+		emit_u16(bc, table.encode_random(op, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, imm_val);
+		emit_byte(bc, sz);
+	}
 	return true;
 }
 

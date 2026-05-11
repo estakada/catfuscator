@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Continue"
 
 $vcredist = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-$Catfuscator = "C:\protection\Catfuscator\Catfuscator\build_tmp\Catfuscator-con.exe"
+$Catfuscator = "C:\protection\Catfuscator\Catfuscator\x64\Release\Catfuscator-con.exe"
 $workdir = "C:\protection\Catfuscator"
 $objdir = "C:\protection\Catfuscator\test"
 

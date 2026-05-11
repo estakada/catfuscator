@@ -43,8 +43,9 @@ private:
 	uint32_t region_counter;
 	uint64_t image_base;
 
-	static constexpr int ENCRYPT_KEY_SIZE = 32;
+	static constexpr int ENCRYPT_KEY_SIZE = 16;
 	uint8_t encrypt_key[ENCRYPT_KEY_SIZE];
 	void generate_key(uint32_t region_seed);
 	void encrypt_bytecode(std::vector<uint8_t>& bytecode);
+	static void rc4_crypt(uint8_t* data, size_t len, const uint8_t* key, int key_len);
 };

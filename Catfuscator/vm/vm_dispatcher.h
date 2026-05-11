@@ -32,6 +32,8 @@ private:
 	uint64_t compile_image_base;
 	bool nested_mode;
 	uint64_t inner_dispatcher_rva;
+	const uint8_t* dispatch_key = nullptr;
+	int dispatch_key_size = 0;
 public:
 	void set_inner_dispatcher_rva(uint64_t rva) { inner_dispatcher_rva = rva; }
 private:
@@ -44,12 +46,17 @@ private:
 		asmjit::Label exit_label;
 		asmjit::Label handlers[static_cast<int>(vm_op::VM_COUNT)];
 		asmjit::Label dup_handlers[vm_opcode_table::TOTAL_DUPS];
+		// Jump table dispatch: resolved handler offsets (populated post-assembly)
+		std::vector<uint32_t> handler_offsets;
+		// jt_table label (needed for post-processing offset resolution)
+		asmjit::Label jt_table_label;
 	};
 
 	void emit_enter_handler(asmjit::x86::Assembler& a, handler_labels& labels,
 		const uint8_t* key, int key_size, uint32_t bytecode_size, uint64_t imm_xor_key);
 	void emit_exit_handler(asmjit::x86::Assembler& a, handler_labels& labels);
-	void emit_dispatch_loop(asmjit::x86::Assembler& a, handler_labels& labels);
+	void emit_dispatch_loop(asmjit::x86::Assembler& a, handler_labels& labels,
+		const uint8_t* key, int key_size);
 
 	// Opcode handlers
 	void emit_nop_handler(asmjit::x86::Assembler& a, handler_labels& labels);

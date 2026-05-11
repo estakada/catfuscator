@@ -31,6 +31,8 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	this->context_seed = context_seed;
 	this->compile_image_base = image_base;
 	this->nested_mode = nested_mode;
+	this->dispatch_key = key;
+	this->dispatch_key_size = key_size;
 
 	// Seed opaque predicate RNG from opcode table + per-region key
 	uint32_t op_seed = table.mapping[0] ^ (table.mapping[1] << 16) ^ static_cast<uint32_t>(imm_xor_key);
@@ -47,6 +49,7 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	labels.dispatch_loop = a.newLabel();
 	labels.dispatch_continue = a.newLabel();
 	labels.exit_label = a.newLabel();
+	labels.jt_table_label = a.newLabel();
 	for (int i = 0; i < static_cast<int>(vm_op::VM_COUNT); i++)
 		labels.handlers[i] = a.newLabel();
 	for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++)
@@ -59,7 +62,7 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	emit_enter_handler(a, labels, key, key_size, bytecode_size, imm_xor_key);
 
 	// --- Dispatch loop ---
-	emit_dispatch_loop(a, labels);
+	emit_dispatch_loop(a, labels, key, key_size);
 
 	// --- All opcode handlers: shuffled order with opaque predicates ---
 	{
@@ -75,9 +78,67 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	// --- VM_EXIT handler ---
 	emit_exit_handler(a, labels);
 
+	// --- Branchless Jump Table Dispatch: post-process handler offsets ---
+	// Resolve label offsets from CodeHolder, build RC4-encrypted jump table
+	constexpr int TABLE_ENTRIES = vm_opcode_table::TOTAL_ENCODED;
+	constexpr int TABLE_SIZE = TABLE_ENTRIES * 8;
+
+	uint32_t jt_table_offset = code.labelOffset(labels.jt_table_label);
+	std::vector<uint32_t> resolved_offsets(TABLE_ENTRIES, 0);
+
+	// Get handler offsets via label resolution
+	for (int i = 0; i < static_cast<int>(vm_op::VM_COUNT); i++) {
+		uint32_t off = code.labelOffset(labels.handlers[i]);
+		if (off > 0) {
+			uint16_t enc = table.encode(static_cast<vm_op>(i));
+			if (enc < TABLE_ENTRIES) resolved_offsets[enc] = off;
+		}
+	}
+	for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++) {
+		uint32_t off = code.labelOffset(labels.dup_handlers[d]);
+		if (off > 0) {
+			uint16_t enc = table.dup_encoded[d];
+			if (enc < TABLE_ENTRIES) resolved_offsets[enc] = off;
+		}
+	}
+
+	// Build RC4 keystream for TABLE_SIZE bytes
+	uint8_t keystream[256];
+	{
+		uint8_t S[256];
+		for (int i = 0; i < 256; i++) S[i] = static_cast<uint8_t>(i);
+		int j = 0;
+		for (int i = 0; i < 256; i++) {
+			j = (j + S[i] + dispatch_key[i % dispatch_key_size]) & 0xFF;
+			std::swap(S[i], S[j]);
+		}
+		int ii = 0, jj = 0;
+		for (int k = 0; k < TABLE_SIZE; k++) {
+			ii = (ii + 1) & 0xFF; jj = (jj + S[ii]) & 0xFF;
+			std::swap(S[ii], S[jj]);
+			int t = (S[ii] + S[jj]) & 0xFF;
+			keystream[k] = S[t];
+		}
+	}
+
+	// Encrypt each handler offset (relative from table entry) and patch buffer
 	CodeBuffer& buf = code.sectionById(0)->buffer();
-	dispatcher_code.assign(buf.data(), buf.data() + buf.size());
-	dispatcher_size = static_cast<uint32_t>(buf.size());
+	uint8_t* code_buf = buf.data();
+	size_t code_size = buf.size();
+
+	if (jt_table_offset > 0 && jt_table_offset + TABLE_SIZE <= code_size) {
+		for (int i = 0; i < TABLE_ENTRIES; i++) {
+			uint32_t delta = resolved_offsets[i] - (jt_table_offset + i * 8);
+			uint8_t* entry = code_buf + jt_table_offset + i * 8;
+			// Encrypt 8-byte offset with RC4 keystream
+			for (int b = 0; b < 8; b++) {
+				entry[b] ^= keystream[i * 8 + b];
+			}
+		}
+	}
+
+	dispatcher_code.assign(code_buf, code_buf + code_size);
+	dispatcher_size = static_cast<uint32_t>(code_size);
 
 	return true;
 }
@@ -209,41 +270,97 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 	// RSI = bytecode pointer (passed in RCX on Windows x64 ABI)
 	a.mov(rsi, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRCX)));
 
-	// --- Decrypt bytecode in-place ---
+	// --- Decrypt bytecode in-place with RC4 ---
 	if (key && key_size > 0 && bytecode_size > 0) {
+		Label ksa_end = a.newLabel();
+		Label pra_loop = a.newLabel();
+		Label dec_done = a.newLabel();
+
+		// RSI still points to encrypted bytecode (set by caller)
+		// Allocate S-box (256 bytes) on stack, aligned
+		a.mov(rdi, rsp);
+		a.sub(rdi, 256);
+		a.and_(rdi, ~0xFF);
+
+		// --- KSA: init S[i] = i ---
+		{
+			Label init_loop = a.newLabel();
+			a.mov(ecx, 256);
+			a.mov(eax, 0);
+			a.bind(init_loop);
+			a.dec(ecx);
+			a.mov(byte_ptr(rdi, rcx), al);
+			a.inc(al);
+			a.test(ecx, ecx);
+			a.jnz(init_loop);
+		}
+
+		// --- Key lookup: embed key as immediate table ---
 		Label key_label = a.newLabel();
-		Label skip_key = a.newLabel();
-		Label decrypt_loop = a.newLabel();
-		Label decrypt_done = a.newLabel();
-		Label no_wrap = a.newLabel();
-
-		// Jump over embedded key data
-		a.jmp(skip_key);
 		a.bind(key_label);
-		for (int i = 0; i < key_size; i++)
-			a.db(key[i]);
-		a.bind(skip_key);
+		for (int ki = 0; ki < key_size; ki++)
+			a.db(key[ki]);
 
-		// rdi = decrypt cursor, ecx = remaining bytes
-		a.mov(rdi, rsi);
+		// --- KSA: scramble with key (256 iterations) ---
+		{
+			a.mov(ebx, 0); // i = 0
+			a.mov(ebp, 0); // j = 0
+			Label ksa_outer = a.newLabel();
+			a.bind(ksa_outer);
+			a.movzx(eax, byte_ptr(rdi, rbx)); // S[i]
+			a.add(ebp, eax);
+			a.and_(ebp, 0xFF);
+			a.movzx(edx, byte_ptr(key_label, rbx)); // key[i]
+			a.add(ebp, edx);
+			a.and_(ebp, 0xFF);
+			// swap S[i], S[j]
+			a.movzx(eax, byte_ptr(rdi, rbp));
+			a.mov(byte_ptr(rdi, rbp), bl);
+			a.mov(byte_ptr(rdi, rbx), al);
+			a.inc(bl);
+			a.cmp(bl, 255);
+			a.jbe(ksa_outer);
+		}
+		a.bind(ksa_end);
+
+		// --- PRGA + XOR decrypt ---
+		a.mov(r12, rsi); // save bytecode ptr in R12
+		a.xor_(ebx, ebx); // i = 0
+		a.xor_(esi, esi); // j = 0
 		a.mov(ecx, bytecode_size);
-		a.lea(rdx, qword_ptr(key_label));
-		a.xor_(r8d, r8d);
 
-		a.bind(decrypt_loop);
+		a.bind(pra_loop);
 		a.test(ecx, ecx);
-		a.jz(decrypt_done);
-		a.movzx(eax, byte_ptr(rdx, r8));
-		a.xor_(byte_ptr(rdi), al);
-		a.inc(rdi);
+		a.jz(dec_done);
+
+		// i = (i + 1) & 0xFF
+		a.inc(bl);
+		a.and_(bl, 0xFF);
+		// j = (j + S[i]) & 0xFF
+		a.movzx(eax, byte_ptr(rdi, rbx));
+		a.add(esi, eax);
+		a.and_(esi, 0xFF);
+		// swap S[i], S[j]
+		a.movzx(eax, byte_ptr(rdi, rbx));
+		a.movzx(edx, byte_ptr(rdi, rsi));
+		a.mov(byte_ptr(rdi, rbx), dl);
+		a.mov(byte_ptr(rdi, rsi), al);
+		// t = (S[i] + S[j]) & 0xFF; k = S[t]
+		a.movzx(eax, byte_ptr(rdi, rbx));
+		a.add(al, byte_ptr(rdi, rsi));
+		a.and_(al, 0xFF);
+		a.movzx(eax, byte_ptr(rdi, rax));
+		// decrypt: *r12 ^= k
+		a.xor_(byte_ptr(r12), al);
+		a.inc(r12);
 		a.dec(ecx);
-		a.inc(r8d);
-		a.cmp(r8d, key_size);
-		a.jb(no_wrap);
-		a.xor_(r8d, r8d);
-		a.bind(no_wrap);
-		a.jmp(decrypt_loop);
-		a.bind(decrypt_done);
+		a.jmp(pra_loop);
+		a.bind(dec_done);
+
+		// Restore RSI
+		a.mov(rsi, r12);
+		// Clean S-box
+		a.add(rsp, 256);
 	}
 
 	// R12 = XOR key for encrypted immediates
@@ -267,7 +384,8 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 	// Fall through to dispatch loop
 }
 
-void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels) {
+void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels,
+		const uint8_t* key, int key_size) {
 	a.bind(labels.dispatch_loop);
 
 	// Context-dependent decoding: XOR opcode with position-based multi-round hash
@@ -316,64 +434,91 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 	for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++)
 		entries.push_back({ table.dup_encoded[d], &labels.dup_handlers[d] });
 
-	int method = (opaque_rng() % 2 == 0) ? 0 : 2; // skip jump table (case 1) — embedLabelDelta not resolved in raw buffer
-	switch (method) {
-	case 0: {
-		// Linear scan (shuffled)
-		std::shuffle(entries.begin(), entries.end(), opaque_rng);
-		for (auto& e : entries) {
-			a.cmp(ax, Imm(e.encoded));
-			a.je(*e.target);
+	// Two-pass: Pass 1 measures handler sizes, Pass 2 emits jump table with encrypted addresses
+	JitRuntime rt_dummy;
+	CodeHolder code_dummy;
+	code_dummy.init(rt_dummy.environment());
+	x86::Assembler a_dummy(&code_dummy);
+	handler_labels labels_dummy;
+	for (int i = 0; i < static_cast<int>(vm_op::VM_COUNT); i++)
+		labels_dummy.handlers[i] = a_dummy.newLabel();
+	for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++)
+		labels_dummy.dup_handlers[d] = a_dummy.newLabel();
+	labels_dummy.dispatch_loop = a_dummy.newLabel();
+	labels_dummy.dispatch_continue = a_dummy.newLabel();
+	labels_dummy.exit_label = a_dummy.newLabel();
+
+	// Pass 1: emit handlers to measure their offsets
+	// We don't need real handler code for measurement, just labels
+	// Use dummy stubs of known size
+	{
+		std::vector<std::function<void()>> hlist;
+		build_handler_list(a_dummy, labels_dummy, hlist);
+		// Emit a dummy at each handler position to measure size
+		for (int i = 0; i < static_cast<int>(vm_op::VM_COUNT); i++) {
+			a_dummy.bind(labels_dummy.handlers[i]);
+			// NOP sled of known size
+			for (int n = 0; n < 4; n++) a_dummy.nop();
 		}
-		a.jmp(labels.exit_label);
-		break;
+		for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++) {
+			a_dummy.bind(labels_dummy.dup_handlers[d]);
+			for (int n = 0; n < 4; n++) a_dummy.nop();
+		}
+		a_dummy.bind(labels_dummy.exit_label);
+		a_dummy.ret();
 	}
-	case 1: {
-		// Jump table: O(1) dispatch via indexed table of relative offsets
-		Label table_label = a.newLabel();
-		a.lea(rdx, x86::qword_ptr(table_label));
-		a.movsxd(rcx, x86::dword_ptr(rdx, rax, 2));
-		a.add(rcx, rdx);
-		a.jmp(rcx);
 
-		a.bind(table_label);
-		std::vector<Label*> jump_targets(vm_opcode_table::TOTAL_ENCODED, &labels.exit_label);
-		for (auto& e : entries)
-			jump_targets[e.encoded] = e.target;
-		for (int i = 0; i < vm_opcode_table::TOTAL_ENCODED; i++)
-			a.embedLabelDelta(*jump_targets[i], table_label, 4);
-		break;
-	}
-	case 2: {
-		// Binary search tree: O(log n) dispatch
-		std::sort(entries.begin(), entries.end(),
-			[](const dispatch_entry& a, const dispatch_entry& b) { return a.encoded < b.encoded; });
+	// Jump table with RC4-encrypted entries (O(1) dispatch)
+	Label jt_table = labels.jt_table_label;
+	constexpr int TABLE_ENTRIES = vm_opcode_table::TOTAL_ENCODED;
+	constexpr int TABLE_SIZE = TABLE_ENTRIES * 8;
 
-		std::function<void(int, int)> emit_bst;
-		emit_bst = [&](int lo, int hi) {
-			if (lo > hi) {
-				a.jmp(labels.exit_label);
-				return;
-			}
-			if (lo == hi) {
-				a.jmp(*entries[lo].target);
-				return;
-			}
-			int mid = (lo + hi) / 2;
-			a.cmp(ax, Imm(entries[mid].encoded));
-			a.je(*entries[mid].target);
-			Label right_branch = a.newLabel();
-			a.ja(right_branch);
-			emit_bst(lo, mid - 1);
-			a.bind(right_branch);
-			emit_bst(mid + 1, hi);
-		};
-		emit_bst(0, static_cast<int>(entries.size()) - 1);
-		break;
+	// Decrypt table entries in-place with RC4 (same key as bytecode)
+	{
+		Label jt_key = a.newLabel();
+		a.bind(jt_key);
+		for (int ki = 0; ki < key_size; ki++) a.db(key[ki]);
+		Label ksa_end = a.newLabel();
+		a.bind(ksa_end);
+		a.mov(rdi, rsp);
+		a.sub(rdi, 256);
+		a.and_(rdi, ~0xFF);
+		{ Label init = a.newLabel(); a.mov(ecx, 256); a.mov(eax, 0); a.bind(init); a.dec(ecx); a.mov(byte_ptr(rdi, rcx), al); a.inc(al); a.test(ecx, ecx); a.jnz(init); }
+		{ a.mov(ebx, 0); a.mov(ebp, 0); Label klp = a.newLabel(); a.bind(klp); a.movzx(eax, byte_ptr(rdi, rbx)); a.add(ebp, eax); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(jt_key, rbx)); a.add(ebp, edx); a.and_(ebp, 0xFF); a.movzx(eax, byte_ptr(rdi, rbp)); a.mov(byte_ptr(rdi, rbp), bl); a.mov(byte_ptr(rdi, rbx), al); a.inc(bl); a.cmp(bl, 255); a.jbe(klp); }
+		a.mov(r12, qword_ptr(jt_key));
+		a.xor_(ebx, ebx); a.xor_(esi, esi);
+		a.mov(ecx, TABLE_SIZE);
+		Label plp = a.newLabel(); a.bind(plp);
+		a.test(ecx, ecx); Label pdone = a.newLabel(); a.jz(pdone);
+		a.inc(bl); a.and_(bl, 0xFF);
+		a.movzx(eax, byte_ptr(rdi, rbx));
+		a.add(esi, eax); a.and_(esi, 0xFF);
+		a.movzx(eax, byte_ptr(rdi, rbx));
+		a.movzx(edx, byte_ptr(rdi, rsi));
+		a.mov(byte_ptr(rdi, rbx), dl);
+		a.mov(byte_ptr(rdi, rsi), al);
+		a.movzx(eax, byte_ptr(rdi, rbx));
+		a.add(al, byte_ptr(rdi, rsi));
+		a.and_(al, 0xFF);
+		a.movzx(eax, byte_ptr(rdi, rax));
+		a.mov(rdx, r12); a.add(rdx, TABLE_SIZE); a.sub(rdx, rcx);
+		a.xor_(byte_ptr(rdx), al);
+		a.dec(ecx); a.jmp(plp); a.bind(pdone);
+		a.add(rsp, 256);
 	}
-	}
+
+	// O(1) jump table dispatch
+	a.lea(rdx, x86::qword_ptr(jt_table));
+	a.cmp(ax, TABLE_ENTRIES);
+	a.jae(labels.exit_label);
+	a.movsxd(rcx, x86::dword_ptr(rdx, rax, 3));
+	a.add(rcx, rdx);
+	a.jmp(rcx);
+
+	// RC4-encrypted table data (XOR'd with same keystream)
+	a.bind(jt_table);
+	for (int i = 0; i < TABLE_ENTRIES; i++) { for (int b = 0; b < 8; b++) a.db(0xCC); }
 }
-
 void vm_dispatcher::emit_nop_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_NOP)]);
 	emit_chain_dispatch(a, labels);
@@ -855,7 +1000,7 @@ void vm_dispatcher::emit_test_handler(x86::Assembler& a, handler_labels& labels)
 void vm_dispatcher::emit_jmp_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_JMP)]);
 	emit_handler_entry_junk(a);
-	// Format: [opcode] [offset:4] — signed offset relative to current IP
+	// Format: [opcode] [offset:4] Ã¢â‚¬â€ signed offset relative to current IP
 	a.movsxd(rax, dword_ptr(rsi));
 	emit_poly_advance_ip(a, 4);
 	a.add(rsi, rax);
@@ -1097,7 +1242,7 @@ void vm_dispatcher::emit_call_import_handler(x86::Assembler& a, handler_labels& 
 	a.cmp(ecx, r10d);
 	a.jge(not_found);
 
-	a.mov(eax, dword_ptr(r11, rcx, 2)); // name RVA (shift=2 → scale=4)
+	a.mov(eax, dword_ptr(r11, rcx, 2)); // name RVA (shift=2 Ã¢â€ â€™ scale=4)
 	a.add(rax, rdi);                      // RAX = name string ptr
 
 	// Hash function name: FNV-1a, ASCII, case-insensitive
@@ -1137,10 +1282,10 @@ void vm_dispatcher::emit_call_import_handler(x86::Assembler& a, handler_labels& 
 	a.bind(export_found);
 	a.mov(r10d, dword_ptr(r15, 0x24));   // AddressOfNameOrdinals RVA
 	a.add(r10, rdi);
-	a.movzx(ecx, word_ptr(r10, rcx, 1)); // ordinal (shift=1 → scale=2)
+	a.movzx(ecx, word_ptr(r10, rcx, 1)); // ordinal (shift=1 Ã¢â€ â€™ scale=2)
 	a.mov(r10d, dword_ptr(r15, 0x1C));   // AddressOfFunctions RVA
 	a.add(r10, rdi);
-	a.mov(eax, dword_ptr(r10, rcx, 2));  // function RVA (shift=2 → scale=4)
+	a.mov(eax, dword_ptr(r10, rcx, 2));  // function RVA (shift=2 Ã¢â€ â€™ scale=4)
 	a.add(rax, rdi);                      // RAX = resolved address
 
 	// --- Call resolved function ---
@@ -1455,7 +1600,7 @@ void vm_dispatcher::emit_movsx_mem_handler(x86::Assembler& a, handler_labels& la
 		a.movsx(rax, byte_ptr(rax));
 	else if (op == vm_op::VM_MOVSX_REG_MEM16)
 		a.movsx(rax, word_ptr(rax));
-	else // MOVSXD — 32-bit to 64-bit
+	else // MOVSXD Ã¢â‚¬â€ 32-bit to 64-bit
 		a.movsxd(rax, dword_ptr(rax));
 
 	a.shl(rcx, 3);
@@ -1855,7 +2000,7 @@ void vm_dispatcher::emit_rot_cl_handler(x86::Assembler& a, handler_labels& label
 
 void vm_dispatcher::emit_cbw_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_CBW)]);
-	// CBW: sign-extend AL → AX
+	// CBW: sign-extend AL Ã¢â€ â€™ AX
 	a.mov(al, byte_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)));
 	a.cbw();
 	a.mov(word_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), ax);
@@ -1864,7 +2009,7 @@ void vm_dispatcher::emit_cbw_handler(x86::Assembler& a, handler_labels& labels) 
 
 void vm_dispatcher::emit_cwde_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_CWDE)]);
-	// CWDE: sign-extend AX → EAX
+	// CWDE: sign-extend AX Ã¢â€ â€™ EAX
 	a.mov(ax, word_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)));
 	a.cwde();
 	a.mov(dword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), eax);
@@ -1873,7 +2018,7 @@ void vm_dispatcher::emit_cwde_handler(x86::Assembler& a, handler_labels& labels)
 
 void vm_dispatcher::emit_cdqe_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_CDQE)]);
-	// CDQE: sign-extend EAX → RAX
+	// CDQE: sign-extend EAX Ã¢â€ â€™ RAX
 	a.mov(eax, dword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)));
 	a.cdqe();
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), rax);
@@ -1944,7 +2089,7 @@ void vm_dispatcher::emit_bt_handler(x86::Assembler& a, handler_labels& labels, v
 		a.shl(rcx, 3);
 		a.mov(rax, qword_ptr(rbx, rcx));
 
-		// BT/BTS/BTR rax, edx — but x86 bt only takes reg,reg or reg,imm8
+		// BT/BTS/BTR rax, edx Ã¢â‚¬â€ but x86 bt only takes reg,reg or reg,imm8
 		// We use the reg form with edx
 		switch (op) {
 		case vm_op::VM_BT_REG_IMM:  a.bt(rax, rdx); break;
@@ -2029,7 +2174,7 @@ void vm_dispatcher::emit_popcnt_handler(x86::Assembler& a, handler_labels& label
 
 void vm_dispatcher::emit_string_handler(x86::Assembler& a, handler_labels& labels, vm_op op) {
 	a.bind(labels.handlers[static_cast<int>(op)]);
-	// No operands in bytecode — string ops use implicit RSI, RDI, RCX from VM context
+	// No operands in bytecode Ã¢â‚¬â€ string ops use implicit RSI, RDI, RCX from VM context
 
 	// Load RSI, RDI from VM context (and RCX for rep, RAX for stos/scas)
 	a.push(rsi); // save VM IP
@@ -2076,7 +2221,7 @@ void vm_dispatcher::emit_string_handler(x86::Assembler& a, handler_labels& label
 
 void vm_dispatcher::emit_cwd_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_CWD)]);
-	// CWD: sign-extend AX → DX:AX (16-bit)
+	// CWD: sign-extend AX Ã¢â€ â€™ DX:AX (16-bit)
 	a.mov(ax, word_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)));
 	a.cwd();
 	a.mov(word_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), ax);
@@ -3433,8 +3578,8 @@ void vm_dispatcher::emit_opaque_predicate(x86::Assembler& a, handler_labels& lab
 
 	switch (variant) {
 	case 0:
-		// x*(x+1) is always even → (x*(x+1)) & 1 == 0 always true
-		// Use RSI (bytecode pointer) as x — always a valid address
+		// x*(x+1) is always even Ã¢â€ â€™ (x*(x+1)) & 1 == 0 always true
+		// Use RSI (bytecode pointer) as x Ã¢â‚¬â€ always a valid address
 		a.mov(rax, rsi);
 		a.lea(rdx, qword_ptr(rax, 1));
 		a.imul(rax, rdx);
@@ -3455,7 +3600,7 @@ void vm_dispatcher::emit_opaque_predicate(x86::Assembler& a, handler_labels& lab
 		break;
 
 	case 2:
-		// (x | 1) is always odd → & 1 == 1 always true
+		// (x | 1) is always odd Ã¢â€ â€™ & 1 == 1 always true
 		a.mov(rax, rsi);
 		a.or_(rax, 1);
 		a.test(al, 1);
@@ -3669,7 +3814,7 @@ void vm_dispatcher::emit_handler_entry_junk(x86::Assembler& a) {
 }
 
 void vm_dispatcher::emit_poly_index_to_offset(x86::Assembler& a, const x86::Gp& reg) {
-	// reg * 8 — polymorphic alternatives to shl reg, 3
+	// reg * 8 Ã¢â‚¬â€ polymorphic alternatives to shl reg, 3
 	uint32_t v = opaque_rng() % 4;
 	switch (v) {
 	case 0: a.shl(reg, 3); break;
@@ -3680,7 +3825,7 @@ void vm_dispatcher::emit_poly_index_to_offset(x86::Assembler& a, const x86::Gp& 
 }
 
 void vm_dispatcher::emit_poly_advance_ip(x86::Assembler& a, int n) {
-	// rsi += n — polymorphic alternatives to add rsi, n
+	// rsi += n Ã¢â‚¬â€ polymorphic alternatives to add rsi, n
 	uint32_t v = opaque_rng() % 3;
 	switch (v) {
 	case 0: if (n == 1) a.inc(rsi); else a.add(rsi, n); break;

@@ -108,6 +108,10 @@ private:
 	// Opaque constant: sometimes replaces MOV_REG_IMM64 with arithmetic chain
 	void emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, int64_t val);
 
+	// Opaque constant for i32 immediates in ALU ops (ADD/SUB/XOR/AND/OR/CMP/IMUL)
+	// Replaces raw immediate with XOR+ALU chain: vreg = (val ^ A) then ALU_op vreg, B
+	void emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op);
+
 	bool translate_alu_reg_reg(vm_op op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
 	bool translate_alu_reg_imm(vm_op op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
 	bool translate_alu_mem(vm_op reg_reg_op, vm_op reg_imm_op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
