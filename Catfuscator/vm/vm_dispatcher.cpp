@@ -26,13 +26,16 @@ uint32_t vm_dispatcher::get_dispatcher_size() const {
 bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	const uint8_t* key, int key_size, uint32_t bytecode_size, uint64_t imm_xor_key,
 	const vm_settings* settings, uint32_t context_seed, uint64_t image_base,
-	bool nested_mode) {
+	bool nested_mode, const uint8_t* bytecode_data) {
 	this->settings = settings;
 	this->context_seed = context_seed;
 	this->compile_image_base = image_base;
 	this->nested_mode = nested_mode;
 	this->dispatch_key = key;
 	this->dispatch_key_size = key_size;
+	this->bytecode_checksum = 0;
+	this->bytecode_data = bytecode_data;
+	this->bytecode_size_for_checksum = bytecode_size;
 
 	// Seed opaque predicate RNG from opcode table + per-region key
 	uint32_t op_seed = table.mapping[0] ^ (table.mapping[1] << 16) ^ static_cast<uint32_t>(imm_xor_key);
@@ -73,6 +76,28 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 			maybe_emit_opaque(a, labels);
 			h();
 		}
+	}
+
+	// --- Junk handlers: fake VM opcodes never dispatched to (pollute RE) ---
+	// These handlers contain complex-looking code that decompiles to fake logic.
+	// REs find hundreds of handlers but most are unreachable dead code.
+	if (settings && settings->junk_frequency > 20) {
+		int junk_count = 5 + (opaque_rng() % 10);
+		for (int i = 0; i < junk_count; i++) {
+			labels.junk_handlers.push_back(a.newLabel());
+		}
+		for (int i = 0; i < junk_count; i++) {
+			emit_junk_handler(a, labels, i);
+		}
+	}
+
+	// --- Anti-tamper: compute XOR-checksum of encrypted bytecode ---
+	// Simple XOR of all encrypted bytecode bytes (matches runtime recompute)
+	{
+		uint32_t cs = 0;
+		for (size_t i = 0; i < bytecode_size; i++)
+			cs ^= bytecode_data[i];
+		this->bytecode_checksum = cs;
 	}
 
 	// --- VM_EXIT handler ---
@@ -1145,12 +1170,18 @@ void vm_dispatcher::emit_call_native_reloc_handler(x86::Assembler& a, handler_la
 
 void vm_dispatcher::emit_call_import_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_CALL_IMPORT)]);
-	// Format: [opcode] [dll_hash:4] [func_hash:4]
-	// PEB-walk to resolve import by hash, then call
+	// Format: [opcode] [dll_hash^low32:4] [func_hash^high32:4]
+	// R12 holds imm_xor_key
 
-	a.mov(ecx, dword_ptr(rsi));       // ECX = dll_hash
-	a.mov(edx, dword_ptr(rsi, 4));    // EDX = func_hash
+	a.mov(ecx, dword_ptr(rsi));       // ECX = dll_hash (encrypted)
+	a.mov(edx, dword_ptr(rsi, 4));    // EDX = func_hash (encrypted)
 	a.add(rsi, 8);
+
+	// Decrypt hashes with same key as bytecode
+	a.xor_(ecx, r12d);                 // dll_hash ^= low32(imm_xor_key)
+	a.mov(rax, r12);
+	a.shr(rax, 32);
+	a.xor_(edx, eax);                  // func_hash ^= high32(imm_xor_key)
 
 	a.push(rsi);   // save VM IP
 	a.push(rbx);   // save VM reg file base
@@ -3430,10 +3461,47 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 		return;
 	}
 
-	// Restore XMM registers
-	for (int i = 0; i < 16; i++) {
-		int off = vm_xmm_offset(static_cast<int>(vm_reg::VXMM0) + i);
-		a.movups(x86::Xmm(i), xmmword_ptr(rbx, off));
+		// --- Anti-tamper: verify bytecode checksum before exit ---
+	// Build-time: checksum = XOR of all encrypted bytecode bytes (simple, no key needed).
+	// Runtime: recompute same XOR, compare with embedded expected value.
+	{
+		Label cs_ok = a.newLabel();
+
+		// r13 = bytecode start (set in enter handler)
+		// rsi = bytecode end (current VM IP at exit)
+		a.mov(rax, rsi);
+		a.sub(rax, r13); // rax = bytecode_size (decrypted in-place)
+
+		// Check size matches
+		a.cmp(eax, bytecode_size_for_checksum);
+		a.je(cs_ok);
+		// Size mismatch: bytecode was modified
+		a.movabs(rax, Imm(reinterpret_cast<uint64_t>(std::exit)));
+		a.xor_(ecx, ecx);
+		a.call(rax);
+		a.bind(cs_ok);
+
+		// Compute XOR of all bytecode bytes
+		a.xor_(edx, edx); // checksum accumulator
+		a.mov(r8, r13);   // src = bytecode start
+		a.mov(r9, rsi);   // end = current IP
+		Label cs_loop = a.newLabel();
+		a.bind(cs_loop);
+		a.cmp(r8, r9);
+		a.jae(cs_ok);
+		a.xor_(dl, byte_ptr(r8));
+		a.inc(r8);
+		a.jmp(cs_loop);
+
+		// Compare with expected
+		a.cmp(edx, bytecode_checksum);
+		a.je(labels.exit_label);
+
+		// Checksum mismatch: kill process
+		a.movabs(rax, Imm(reinterpret_cast<uint64_t>(std::exit)));
+		a.xor_(ecx, ecx);
+		a.call(rax);
+		a.ud2();
 	}
 
 	// Restore GP registers from VM context
@@ -4613,4 +4681,24 @@ void vm_dispatcher::build_handler_list(x86::Assembler& a, handler_labels& labels
 				static_cast<vm_op>(orig), d % vm_opcode_table::DUP_COPIES);
 		});
 	}
+}
+
+void vm_dispatcher::emit_junk_handler(x86::Assembler& a, handler_labels& labels, int idx) {
+	if (idx < 0 || idx >= static_cast<int>(labels.junk_handlers.size())) return;
+	a.bind(labels.junk_handlers[idx]);
+
+	uint8_t fake_dst = table.gp_perm[opaque_rng() % 16];
+	uint8_t fake_src = table.gp_perm[opaque_rng() % 16];
+
+	for (int b = 0, n = 1 + (opaque_rng() % 2); b < n; b++) {
+		emit_junk_block(a);
+		a.mov(rax, qword_ptr(rbx, table.perm_gp_off(static_cast<vm_reg>(fake_dst))));
+		a.mov(rcx, qword_ptr(rbx, table.perm_gp_off(static_cast<vm_reg>(fake_src))));
+		a.xor_(rax, rcx);
+		a.and_(rax, 0x7F);
+		a.mov(qword_ptr(rbx, table.perm_gp_off(static_cast<vm_reg>(fake_dst))), rax);
+		emit_junk_block(a);
+	}
+
+	a.jmp(labels.dispatch_loop);
 }

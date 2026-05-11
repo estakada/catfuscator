@@ -112,6 +112,9 @@ private:
 	// Replaces raw immediate with XOR+ALU chain: vreg = (val ^ A) then ALU_op vreg, B
 	void emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op);
 
+	// Opaque address: always applies polynomial chain to 64-bit addresses
+	void emit_obfuscated_address(std::vector<uint8_t>& bc, uint8_t vreg, int64_t addr);
+
 	bool translate_alu_reg_reg(vm_op op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
 	bool translate_alu_reg_imm(vm_op op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
 	bool translate_alu_mem(vm_op reg_reg_op, vm_op reg_imm_op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);

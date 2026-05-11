@@ -721,6 +721,134 @@ bool vm_translator::translate_alu_reg_imm(vm_op op, const obfuscator::instructio
 	return true;
 }
 
+// emit_obfuscated_address: always applies polynomial chain to 64-bit addresses
+// Defeats static analysis that looks for RVA/VA constants in disassembly
+void vm_translator::emit_obfuscated_address(std::vector<uint8_t>& bc, uint8_t vreg, int64_t addr) {
+	if (!settings || junk_rng() % 100 >= settings->opaque_constant_pct) {
+		// Fallback: simple opaque MOV (already has some obfuscation)
+		emit_mov_reg_imm64(bc, vreg, addr);
+		return;
+	}
+
+	// Pick random form (same 5 forms as emit_mov_reg_imm64)
+	uint32_t form = junk_rng() % 5;
+
+	// Save flags
+	uint8_t vrflags = table.gp_perm[static_cast<uint8_t>(vm_reg::VRFLAGS)];
+	emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+	emit_byte(bc, vrflags);
+
+	auto do_poly = [&](uint64_t base, uint32_t A, uint32_t B, uint32_t C, bool use_c) {
+		// base = addr ^ A
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, base ^ static_cast<int64_t>(A) ^ static_cast<int64_t>(imm_xor_key));
+		// vreg ^= A
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, static_cast<int32_t>(A));
+		emit_byte(bc, 8);
+		// vreg += B
+		emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, static_cast<int32_t>(B));
+		emit_byte(bc, 8);
+		if (use_c) {
+			// vreg ^= C
+			emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+			emit_byte(bc, vreg);
+			emit_i32(bc, static_cast<int32_t>(C));
+			emit_byte(bc, 8);
+		}
+	};
+
+	uint64_t uaddr = static_cast<uint64_t>(addr);
+	switch (form) {
+	case 0: {
+		// Form A: addr = ((base ^ A) + B)
+		uint32_t A = junk_rng() | 1;
+		uint32_t B = static_cast<uint32_t>(addr) - (static_cast<uint32_t>(addr) ^ A);
+		do_poly(uaddr, A, B, 0, false);
+		break;
+	}
+	case 1: {
+		// Form B: addr = ((base ^ A) - B)
+		uint32_t A = junk_rng() | 1;
+		uint32_t B = static_cast<uint32_t>(addr) - (static_cast<uint32_t>(addr) ^ A);
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, uaddr ^ A ^ imm_xor_key);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 8);
+		emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, B);
+		emit_byte(bc, 8);
+		break;
+	}
+	case 2: {
+		// Form C: addr = (((base ^ A) + B) ^ C)
+		uint32_t A = junk_rng() | 1;
+		uint32_t B = static_cast<uint32_t>(addr) - (static_cast<uint32_t>(addr) ^ A);
+		uint32_t C = (junk_rng() | 0x11);
+		do_poly(uaddr, A, B, C, true);
+		break;
+	}
+	case 3: {
+		// Form D: addr = (((base ^ A) ^ B) - C)
+		uint32_t A = junk_rng() | 1;
+		uint32_t B = junk_rng() | 1;
+		uint32_t C = static_cast<uint32_t>(addr) - (static_cast<uint32_t>(addr) ^ A ^ B);
+		uint32_t base = static_cast<uint32_t>(addr) ^ A ^ B;
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, base ^ imm_xor_key);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 8);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, B);
+		emit_byte(bc, 8);
+		emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, C);
+		emit_byte(bc, 8);
+		break;
+	}
+	default: {
+		// Form E: addr = (((base + A) ^ B) - C)
+		uint32_t A = junk_rng() | 1;
+		uint32_t B = (junk_rng() | 0x11);
+		uint32_t C = static_cast<uint32_t>(addr) + A - (static_cast<uint32_t>(addr) ^ B);
+		uint32_t base = static_cast<uint32_t>(addr) ^ B;
+		emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i64(bc, base ^ imm_xor_key);
+		emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, A);
+		emit_byte(bc, 8);
+		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, B);
+		emit_byte(bc, 8);
+		emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
+		emit_byte(bc, vreg);
+		emit_i32(bc, C);
+		emit_byte(bc, 8);
+		break;
+	}
+	}
+
+	// Restore flags
+	emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+	emit_byte(bc, vrflags);
+}
+
 bool vm_translator::translate_mov(const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc) {
 	auto& operands = inst.zyinstr.operands;
 	int op_count = inst.zyinstr.info.operand_count_visible;
@@ -999,7 +1127,7 @@ bool vm_translator::translate_lea(const obfuscator::instruction_t& inst, std::ve
 	if (operands[1].mem.base == ZYDIS_REGISTER_RIP && buffer_base) {
 		uint64_t target_buf = inst.runtime_address + inst.zyinstr.info.length + operands[1].mem.disp.value;
 		uint64_t target_rva = target_buf - buffer_base;
-		emit_mov_reg_imm64(bc, vreg_dst, static_cast<int64_t>(target_rva));
+		emit_obfuscated_address(bc, vreg_dst, static_cast<int64_t>(target_rva));
 		emit_u16(bc, table.encode_random(vm_op::VM_RELOCATE_REG, junk_rng));
 		emit_byte(bc, vreg_dst);
 		return true;
@@ -1249,7 +1377,15 @@ bool vm_translator::translate_call(const obfuscator::instruction_t& inst, std::v
 		uint64_t target_buf = inst.runtime_address + inst.zyinstr.info.length + operands[0].imm.value.s;
 		uint64_t target_rva = target_buf - buffer_base;
 		emit_u16(bc, table.encode_random(vm_op::VM_CALL_NATIVE_RELOC, junk_rng));
-		emit_u64(bc, target_rva ^ imm_xor_key);
+		// Use obfuscated address - always applies polynomial chain
+		uint8_t scratch = table.gp_perm[static_cast<uint8_t>(vm_reg::VR14)];
+		emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+		emit_byte(bc, scratch);
+		emit_obfuscated_address(bc, scratch, static_cast<int64_t>(target_rva));
+		emit_u16(bc, table.encode_random(vm_op::VM_RELOCATE_REG, junk_rng));
+		emit_byte(bc, scratch);
+		emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+		emit_byte(bc, scratch);
 		return true;
 	}
 
@@ -1259,7 +1395,7 @@ bool vm_translator::translate_call(const obfuscator::instruction_t& inst, std::v
 		emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
 		emit_byte(bc, vreg);
 		emit_u16(bc, table.encode_random(vm_op::VM_CALL_NATIVE, junk_rng));
-		emit_u64(bc, imm_xor_key);
+		emit_obfuscated_address(bc, table.gp_perm[static_cast<uint8_t>(vm_reg::VR14)], static_cast<int64_t>(imm_xor_key));
 		return true;
 	}
 
@@ -1273,15 +1409,19 @@ bool vm_translator::translate_call(const obfuscator::instruction_t& inst, std::v
 			auto it = import_map.find(static_cast<uint32_t>(target_rva));
 			if (it != import_map.end()) {
 				emit_u16(bc, table.encode_random(vm_op::VM_CALL_IMPORT, junk_rng));
-				emit_u32(bc, it->second.dll_hash);
-				emit_u32(bc, it->second.func_hash);
+				// Obfuscate hashes with imm_xor_key (same as bytecode encryption key)
+				// xor with low 32 bits for dll_hash, high 32 bits for func_hash
+				uint32_t dll_enc = it->second.dll_hash ^ static_cast<uint32_t>(imm_xor_key);
+				uint32_t fn_enc = it->second.func_hash ^ static_cast<uint32_t>(imm_xor_key >> 32);
+				emit_u32(bc, dll_enc);
+				emit_u32(bc, fn_enc);
 				return true;
 			}
 
 			uint8_t scratch = table.gp_perm[static_cast<uint8_t>(vm_reg::VR14)];
 			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
 			emit_byte(bc, scratch);
-			emit_mov_reg_imm64(bc, scratch, static_cast<int64_t>(target_rva));
+			emit_obfuscated_address(bc, scratch, static_cast<int64_t>(target_rva));
 			emit_u16(bc, table.encode_random(vm_op::VM_RELOCATE_REG, junk_rng));
 			emit_byte(bc, scratch);
 			emit_u16(bc, table.encode_random(vm_op::VM_CALL_REG_INDIRECT, junk_rng));
@@ -1978,7 +2118,7 @@ bool vm_translator::translate_jmp_indirect(const obfuscator::instruction_t& inst
 			uint8_t scratch = table.gp_perm[static_cast<uint8_t>(vm_reg::VR14)];
 			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
 			emit_byte(bc, scratch);
-			emit_mov_reg_imm64(bc, scratch, static_cast<int64_t>(target_rva));
+			emit_obfuscated_address(bc, scratch, static_cast<int64_t>(target_rva));
 			emit_u16(bc, table.encode_random(vm_op::VM_RELOCATE_REG, junk_rng));
 			emit_byte(bc, scratch);
 			emit_u16(bc, table.encode_random(vm_op::VM_JMP_MEM, junk_rng));

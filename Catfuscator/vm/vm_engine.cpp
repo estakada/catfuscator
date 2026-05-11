@@ -452,7 +452,7 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 		vm_dispatcher inner_dispatcher(inner_table);
 		inner_dispatcher.generate(inner_dispatcher_code, inner_key, ENCRYPT_KEY_SIZE,
 			inner_bc_size, inner_imm_xor_key, &settings, inner_context_seed, image_base,
-			true);
+			true, nullptr);
 	}
 
 	// --- Outer bytecode ---
@@ -772,7 +772,7 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 
 	std::vector<uint8_t> dispatcher_code;
 	if (!dispatcher.generate(dispatcher_code, encrypt_key, ENCRYPT_KEY_SIZE, bytecode_size,
-		imm_xor_key, &settings, context_seed, image_base)) {
+		imm_xor_key, &settings, context_seed, image_base, false, bytecode.data())) {
 		printf("[vm_engine] failed to generate dispatcher\n");
 		return false;
 	}
