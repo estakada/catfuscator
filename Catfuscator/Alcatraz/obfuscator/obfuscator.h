@@ -77,6 +77,8 @@ private:
 	bool obfuscate_mov(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool obfuscate_add(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool wrap_jmp_call_junk(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+	bool add_fake_control_flow(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+	bool add_branch_history_obf(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 public:
 
 	obfuscator(pe64* pe);
@@ -86,6 +88,8 @@ public:
 	void run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_point);
 
 	uint32_t get_added_size();
+
+	uint32_t extra_junk_bytes_size;
 
 	struct instruction_t {
 

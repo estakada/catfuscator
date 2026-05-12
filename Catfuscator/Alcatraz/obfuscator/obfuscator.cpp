@@ -737,15 +737,14 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 				}
 			}
 
+			// Antidisassembly junk
 			if (func->antidisassembly) {
 				int randval = rand() % 8 + 1;
-
 				if (randval <= 2) {
 					this->add_junk(func, instruction);
 				}
-
-				// Wrap JMP/CALL with junk instructions
-				this->wrap_jmp_call_junk(func, instruction);
+				// DISABLED: wrap_jmp_call_junk breaks the obfuscation pipeline
+				// this->wrap_jmp_call_junk(func, instruction);
 			}
 
 

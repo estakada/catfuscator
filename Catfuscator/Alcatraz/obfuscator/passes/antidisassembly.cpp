@@ -8,12 +8,22 @@
 //    so that relocate() and compile() handle it properly.
 static obfuscator::instruction_t make_junk_instr(int func_id, std::vector<uint8_t> bytes) {
 	obfuscator::instruction_t inst{};
-	// Use a NOP as the base decoded instruction — we just need valid info.length
-	uint8_t nop = 0x90;
 	inst.load(func_id, bytes);
-	// Override Zydis decode results: set length = actual raw size
 	inst.zyinstr.info.length = (uint8_t)bytes.size();
-	// Not a jump/call, don't relocate
+	inst.isjmpcall = false;
+	inst.has_relative = false;
+	return inst;
+}
+
+// Same as make_junk_instr but also forces isjmpcall=false for fake CF blocks
+// that contain embedded jmp/call opcodes (to prevent convert_relative_jmps
+// from trying to resolve them as real branches).
+static obfuscator::instruction_t make_fake_block_instr(int func_id, std::vector<uint8_t> bytes) {
+	obfuscator::instruction_t inst{};
+	inst.load(func_id, bytes);
+	// Override after load: force isjmpcall=false so convert_relative_jmps
+	// doesn't try to resolve any embedded jmp/call opcodes in the fake block.
+	inst.zyinstr.info.length = (uint8_t)bytes.size();
 	inst.isjmpcall = false;
 	inst.has_relative = false;
 	return inst;
@@ -111,7 +121,7 @@ bool obfuscator::wrap_jmp_call_junk(
 		{ 0x66, 0x90 },                                    // xchg ax,ax (2-byte nop)
 		{ 0x0F, 0x1F, 0x00 },                             // nop [rax]
 		{ 0x0F, 0x1F, 0x40, 0x00 },                      // nop [rax+0]
-		{ 0x40, 0x0F, 0x1F, 0x00 },                      // rex.nop [rax]
+		{ 0x40, 0x1F, 0x00 },                      // rex.nop [rax]
 		{ 0x45, 0x0F, 0x1F, 0xC0 },                      // nop r8/r9/r10/r11
 	};
 
@@ -138,6 +148,117 @@ bool obfuscator::wrap_jmp_call_junk(
 		instruction_t junk = make_junk_instr(function->func_id, pattern);
 		instruction++;
 		instruction = function->instructions.insert(instruction, junk);
+	}
+
+	return true;
+}
+
+// Insert fake control flow blocks: unreachable code blocks with misleading jumps.
+// These look like real code but are never reached, confusing static analysis.
+bool obfuscator::add_fake_control_flow(
+	std::vector<obfuscator::function_t>::iterator& function,
+	std::vector<obfuscator::instruction_t>::iterator& instruction) {
+
+	if (!instruction->isjmpcall)
+		return true;
+
+	std::random_device rd;
+	std::mt19937 gen(rd());
+
+	// Only insert sometimes
+	if ((gen() % 3) != 0)
+		return true;
+
+	// Fake control flow: insert a block that looks like a real function prologue
+	// followed by a jump that never executes
+	std::vector<std::vector<uint8_t>> fake_blocks = {
+		// Block 1: push rbp; mov rbp,rsp; sub rsp,20; jmp $+6
+		{ 0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xEB, 0x04 },
+		// Block 2: xor eax,eax; inc eax; test eax,eax; jz $+4
+		{ 0x31, 0xC0, 0x40, 0x85, 0xC0, 0x74, 0x02, 0xEB, 0xFE },
+		// Block 3: mov rax,0; push rax; pop rax; jmp short $+2
+		{ 0x48, 0x31, 0xC0, 0x50, 0x58, 0xEB, 0x00 },
+		// Block 4: nop; nop; nop; jmp $-1 (infinite loop fake)
+		{ 0x90, 0x90, 0x90, 0xEB, 0xFB },
+		// Block 5: push rbx; xor ebx,ebx; pop rbx; jmp $+3
+		{ 0x53, 0x31, 0xDB, 0x5B, 0xEB, 0x01 },
+		// Block 6: mov rdi,0; mov rsi,0; jmp $+8
+		{ 0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6, 0xEB, 0x06 },
+	};
+
+	auto& block = fake_blocks[gen() % fake_blocks.size()];
+	instruction_t fake = make_fake_block_instr(function->func_id, block);
+
+	// Insert fake block BEFORE the real JMP/CALL
+	instruction = function->instructions.insert(instruction, fake);
+	instruction++;
+
+	// Add a conditional jump that also never executes (for extra confusion)
+	if ((gen() % 2) == 0) {
+		std::vector<uint8_t> fake_cond = { 0x0F, 0x84, 0x00, 0x00, 0x00, 0x00 }; // jz $+0 (never taken, offset = 0 means it points to itself)
+		// Actually use a more realistic fake: jmp $+3; db garbage
+		fake_cond = { 0xEB, 0x02, 0x0F, 0x84, 0x00, 0x00, 0x90 }; // jmp $+2; jz $+0; nop
+		instruction_t fake_c = make_junk_instr(function->func_id, fake_cond);
+		instruction = function->instructions.insert(instruction, fake_c);
+		instruction++;
+	}
+
+	return true;
+}
+
+// Insert branch history obfuscation: dummy push/pop pairs, fake return addresses.
+// Confuses ROP/JOP gadget detection by leaving fake return addresses on stack.
+bool obfuscator::add_branch_history_obf(
+	std::vector<obfuscator::function_t>::iterator& function,
+	std::vector<obfuscator::instruction_t>::iterator& instruction) {
+
+	if (!instruction->isjmpcall)
+		return true;
+
+	std::random_device rd;
+	std::mt19937 gen(rd());
+
+	// Only insert sometimes
+	if ((gen() % 4) != 0)
+		return true;
+
+	// Patterns that leave garbage on stack / confuse return detection
+	std::vector<std::vector<uint8_t>> hist_patterns = {
+		// push rax; pop rcx; (garbles stack tracking)
+		{ 0x50, 0x59 },
+		// push rax; push rdx; pop rax; pop rdx (double swap)
+		{ 0x50, 0x52, 0x58, 0x5A },
+		// pushfq; pop rax (moves flags to reg)
+		{ 0x9C, 0x58 },
+		// mov qword ptr [rsp-8], rax; mov rax, [rsp-8] (stack frame confuse)
+		{ 0x48, 0x89, 0x44, 0x24, 0xF8, 0x48, 0x8B, 0x44, 0x24, 0xF8 },
+		// push rbp; mov rbp, rsp; pop rbp (standard prologue)
+		{ 0x55, 0x48, 0x89, 0xE5, 0x5D },
+		// sub rsp,8; add rsp,8 (stack alignment noise)
+		{ 0x48, 0x83, 0xEC, 0x08, 0x48, 0x83, 0xC4, 0x08 },
+		// mov rax, [rsp]; mov [rsp], rax (stack value swap)
+		{ 0x48, 0x8B, 0x04, 0x24, 0x48, 0x89, 0x04, 0x24 },
+		// pushfq; popfq; nop (flags confuse)
+		{ 0x9C, 0x9D, 0x90 },
+		// xchg rax, rdx; xchg rdx, rax (register swap)
+		{ 0x92, 0x92 },
+		// push rax; and eax, 0; pop rax (zeroing via stack)
+		{ 0x50, 0x25, 0x00, 0x00, 0x00, 0x00, 0x58 },
+	};
+
+	auto& pattern = hist_patterns[gen() % hist_patterns.size()];
+	instruction_t obf = make_junk_instr(function->func_id, pattern);
+
+	// Insert before and after
+	instruction = function->instructions.insert(instruction, obf);
+	instruction++;
+
+	// Also insert after the JMP/CALL
+	if ((gen() % 2) == 0) {
+		auto& pattern2 = hist_patterns[gen() % hist_patterns.size()];
+		instruction_t obf2 = make_junk_instr(function->func_id, pattern2);
+		instruction++;
+		instruction = function->instructions.insert(instruction, obf2);
 	}
 
 	return true;
