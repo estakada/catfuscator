@@ -153,6 +153,7 @@
     <ClCompile Include="obfuscator\passes\antidisassembly.cpp" />
     <ClCompile Include="obfuscator\passes\lea.cpp" />
     <ClCompile Include="obfuscator\passes\mov.cpp" />
+    <ClCompile Include="obfuscator\passes\constant_fold.cpp" />
     <ClCompile Include="markers\marker_scanner.cpp" />
     <ClCompile Include="vm\vm_translator.cpp" />
     <ClCompile Include="vm\vm_dispatcher.cpp" />

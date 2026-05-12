@@ -733,7 +733,10 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 			if (func->movobf) {
 				if (instruction->zyinstr.info.mnemonic == ZYDIS_MNEMONIC_MOV)
 				{
-					this->obfuscate_mov(func, instruction);
+					// Try constant folding first (non-JIT, inserts decoded instructions)
+					// If it succeeds, skip the JIT-based obfuscate_mov
+					if (!this->obfuscate_constant(func, instruction))
+						this->obfuscate_mov(func, instruction);
 				}
 			}
 

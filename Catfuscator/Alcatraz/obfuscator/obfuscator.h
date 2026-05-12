@@ -79,6 +79,7 @@ private:
 	bool wrap_jmp_call_junk(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool add_fake_control_flow(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool add_branch_history_obf(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+	bool obfuscate_constant(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 public:
 
 	obfuscator(pe64* pe);
