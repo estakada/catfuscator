@@ -64,11 +64,9 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	// --- VM_ENTER handler (inline at entry, includes bytecode decrypt) ---
 	emit_enter_handler(a, labels, key, key_size, bytecode_size, imm_xor_key);
 
-	// --- Dispatch loop ---
-	emit_dispatch_loop(a, labels, key, key_size);
-
-	// --- All opcode handlers: shuffled order with opaque predicates ---
-	{
+	// --- Emit handlers BEFORE dispatch_loop in indirect mode (for PC-relative LEA) ---
+	if (settings && settings->indirect_dispatch) {
+		// Handlers first so labels are bound before dispatch_loop references them
 		std::vector<std::function<void()>> handler_list;
 		build_handler_list(a, labels, handler_list);
 		std::shuffle(handler_list.begin(), handler_list.end(), opaque_rng);
@@ -76,23 +74,48 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 			maybe_emit_opaque(a, labels);
 			h();
 		}
+		if (settings && settings->junk_frequency > 20) {
+			int junk_count = 5 + (opaque_rng() % 10);
+			for (int i = 0; i < junk_count; i++) {
+				labels.junk_handlers.push_back(a.newLabel());
+			}
+			for (int i = 0; i < junk_count; i++) {
+				emit_junk_handler(a, labels, i);
+			}
+		}
+		// VM_EXIT
+		emit_exit_handler(a, labels);
 	}
 
-	// --- Junk handlers: fake VM opcodes never dispatched to (pollute RE) ---
-	// These handlers contain complex-looking code that decompiles to fake logic.
-	// REs find hundreds of handlers but most are unreachable dead code.
-	if (settings && settings->junk_frequency > 20) {
-		int junk_count = 5 + (opaque_rng() % 10);
-		for (int i = 0; i < junk_count; i++) {
-			labels.junk_handlers.push_back(a.newLabel());
+	// --- Dispatch loop ---
+	emit_dispatch_loop(a, labels, key, key_size);
+
+	// --- All opcode handlers (normal mode) ---
+	if (!settings || !settings->indirect_dispatch) {
+		std::vector<std::function<void()>> handler_list;
+		build_handler_list(a, labels, handler_list);
+		std::shuffle(handler_list.begin(), handler_list.end(), opaque_rng);
+		for (auto& h : handler_list) {
+			maybe_emit_opaque(a, labels);
+			h();
 		}
-		for (int i = 0; i < junk_count; i++) {
-			emit_junk_handler(a, labels, i);
+
+		// Junk handlers
+		if (settings && settings->junk_frequency > 20) {
+			int junk_count = 5 + (opaque_rng() % 10);
+			for (int i = 0; i < junk_count; i++) {
+				labels.junk_handlers.push_back(a.newLabel());
+			}
+			for (int i = 0; i < junk_count; i++) {
+				emit_junk_handler(a, labels, i);
+			}
 		}
+
+		// VM_EXIT
+		emit_exit_handler(a, labels);
 	}
 
 	// --- Anti-tamper: compute XOR-checksum of encrypted bytecode ---
-	// Simple XOR of all encrypted bytecode bytes (matches runtime recompute)
 	{
 		uint32_t cs = 0;
 		for (size_t i = 0; i < bytecode_size; i++)
@@ -100,16 +123,12 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 		this->bytecode_checksum = cs;
 	}
 
-	// --- VM_EXIT handler ---
-	emit_exit_handler(a, labels);
-
-	// --- Branchless Jump Table Dispatch: post-process handler offsets ---
-	// Resolve label offsets from CodeHolder, build RC4-encrypted jump table
-	constexpr int TABLE_ENTRIES = vm_opcode_table::TOTAL_ENCODED;
-	constexpr int TABLE_SIZE = TABLE_ENTRIES * 8;
-
-	uint32_t jt_table_offset = code.labelOffset(labels.jt_table_label);
-	std::vector<uint32_t> resolved_offsets(TABLE_ENTRIES, 0);
+	// --- Jump table dispatch: post-process handler offsets (skip for indirect mode) ---
+	if (!settings || !settings->indirect_dispatch) {
+		constexpr int TABLE_ENTRIES = vm_opcode_table::TOTAL_ENCODED;
+		constexpr int TABLE_SIZE = TABLE_ENTRIES * 8;
+		uint32_t jt_table_offset = code.labelOffset(labels.jt_table_label);
+		std::vector<uint32_t> resolved_offsets(TABLE_ENTRIES, 0);
 
 	// Get handler offsets via label resolution
 	for (int i = 0; i < static_cast<int>(vm_op::VM_COUNT); i++) {
@@ -152,18 +171,24 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	size_t code_size = buf.size();
 
 	if (jt_table_offset > 0 && jt_table_offset + TABLE_SIZE <= code_size) {
-		for (int i = 0; i < TABLE_ENTRIES; i++) {
-			uint32_t delta = resolved_offsets[i] - (jt_table_offset + i * 8);
-			uint8_t* entry = code_buf + jt_table_offset + i * 8;
-			// Encrypt 8-byte offset with RC4 keystream
-			for (int b = 0; b < 8; b++) {
-				entry[b] ^= keystream[i * 8 + b];
+			for (int i = 0; i < TABLE_ENTRIES; i++) {
+				uint32_t delta = resolved_offsets[i] - (jt_table_offset + i * 8);
+				uint8_t* entry = code_buf + jt_table_offset + i * 8;
+				for (int b = 0; b < 8; b++) {
+					entry[b] ^= keystream[i * 8 + b];
+				}
 			}
 		}
 	}
 
-	dispatcher_code.assign(code_buf, code_buf + code_size);
-	dispatcher_size = static_cast<uint32_t>(code_size);
+	// Finalize: works for both indirect and normal modes
+	{
+		CodeBuffer& final_buf = code.sectionById(0)->buffer();
+		uint8_t* final_code_buf = final_buf.data();
+		size_t final_code_size = final_buf.size();
+		dispatcher_code.assign(final_code_buf, final_code_buf + final_code_size);
+		dispatcher_size = static_cast<uint32_t>(final_code_size);
+	}
 
 	return true;
 }
@@ -513,6 +538,23 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 	for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++)
 		entries.push_back({ table.dup_encoded[d], &labels.dup_handlers[d] });
 
+	if (settings && settings->indirect_dispatch) {
+		// --- Indirect dispatch via polynomial lookup ---
+		// R14 = handler table base (PC-relative, computed from first handler label)
+		a.bind(labels.dispatch_continue);
+		a.lea(r14, x86::ptr(labels.handlers[0])); // PC-relative LEA
+
+		// Compute handler offset: ((A * index + B) & MASK) * STRIDE
+		a.mov(ecx, eax);
+		a.imul(ecx, Imm(997));  // A = 997 (prime)
+		a.add(ecx, Imm(353));   // B = 353
+		a.and_(ecx, Imm(0x7F));  // mask: max 128 handlers
+		a.shl(ecx, 4);          // stride = 16 bytes per handler
+		a.add(rcx, r14);        // rcx = handler_address
+		a.jmp(rcx);
+		return; // indirect mode: no jump table needed
+	}
+
 	// Two-pass: Pass 1 measures handler sizes, Pass 2 emits jump table with encrypted addresses
 	JitRuntime rt_dummy;
 	CodeHolder code_dummy;
@@ -552,6 +594,7 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 	constexpr int TABLE_ENTRIES = vm_opcode_table::TOTAL_ENCODED;
 	constexpr int TABLE_SIZE = TABLE_ENTRIES * 8;
 
+	// O(1) jump table dispatch
 	// Decrypt table entries in-place with RC4 (same key as bytecode)
 	{
 		Label jt_key = a.newLabel();
@@ -4755,4 +4798,35 @@ void vm_dispatcher::emit_junk_handler(x86::Assembler& a, handler_labels& labels,
 	}
 
 	a.jmp(labels.dispatch_loop);
+}
+
+// emit_indirect_dispatch: replaces jump table with polynomial handler lookup
+// Instead of jmp [table + index*8], computes handler via:
+//   handler_offset = (A * index + B) % HANDLER_COUNT * HANDLER_STRIDE
+// RE cannot reconstruct handler mapping without knowing A, B, stride.
+// With shuffled handler order, mapping is fully opaque.
+bool vm_dispatcher::emit_indirect_dispatch(asmjit::x86::Assembler& a,
+	handler_labels& labels, const uint8_t* key, int key_size) {
+
+	if (!settings || !settings->indirect_dispatch)
+		return false;
+
+	Label dispatch_indirect = a.newLabel();
+	a.bind(dispatch_indirect);
+
+	// R14 = handler table base (PC-relative, computed from first handler label)
+	a.lea(r14, x86::ptr(labels.handlers[0]));
+
+	// Compute handler offset: ((A * index + B) & MASK) * STRIDE
+	// EAX already has opcode index from dispatch loop
+	// A = 997 (prime), B = 353, stride = 16 (avg handler size)
+	a.mov(ecx, eax);
+	a.imul(ecx, Imm(997));  // A
+	a.add(ecx, Imm(353));   // B
+	a.and_(ecx, Imm(0x7F));  // mask: max 128 handlers
+	a.shl(ecx, 4);          // stride = 16 bytes per handler
+	a.add(rcx, r14);        // rcx = handler_address
+
+	a.jmp(rcx);
+	return true;
 }

@@ -190,6 +190,10 @@ private:
 	// Handler chaining: inline dispatch instead of jmp dispatch_loop
 	void emit_chain_dispatch(asmjit::x86::Assembler& a, handler_labels& labels);
 
+	// Indirect dispatch: polynomial handler lookup without plaintext jump table
+	bool emit_indirect_dispatch(asmjit::x86::Assembler& a, handler_labels& labels,
+		const uint8_t* key, int key_size);
+
 	// Handler mutation: per-region polymorphism
 	void emit_handler_entry_junk(asmjit::x86::Assembler& a);
 	void emit_poly_index_to_offset(asmjit::x86::Assembler& a, const asmjit::x86::Gp& reg);

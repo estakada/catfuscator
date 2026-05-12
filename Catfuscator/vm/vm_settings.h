@@ -34,6 +34,9 @@ struct vm_settings {
 	bool self_modifying_bytecode = false;
 	int self_modify_interval = 16;  // Re-XOR every N instructions
 
+	// Indirect dispatch: compute handler addresses via polynomial instead of jump table
+	bool indirect_dispatch = false;
+
 	static vm_settings from_profile(vm_profile profile) {
 		vm_settings s;
 		switch (profile) {
@@ -70,6 +73,7 @@ struct vm_settings {
 			s.fake_edge_pct = 15;
 			s.self_modifying_bytecode = true;
 			s.self_modify_interval = 16;
+			s.indirect_dispatch = true;
 			break;
 		}
 		return s;
