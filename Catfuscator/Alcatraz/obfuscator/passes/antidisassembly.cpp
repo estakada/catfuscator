@@ -88,3 +88,57 @@ bool obfuscator::add_junk(std::vector<obfuscator::function_t>::iterator& functio
 	instruction++;
 	return true;
 }
+
+// Insert 1-2 junk instructions BEFORE and AFTER JMP/CALL instructions.
+// Junk instructions have has_relative=false so they don't affect relocation math.
+bool obfuscator::wrap_jmp_call_junk(
+	std::vector<obfuscator::function_t>::iterator& function,
+	std::vector<obfuscator::instruction_t>::iterator& instruction) {
+
+	if (!instruction->isjmpcall)
+		return true;
+
+	std::random_device rd;
+	std::mt19937 gen(rd());
+
+	// How many junk instructions before the JMP/CALL
+	int before_count = (gen() % 2) + 1; // 1 or 2
+	// How many after
+	int after_count = (gen() % 2) + 1;  // 1 or 2
+
+	std::vector<std::vector<uint8_t>> pre_junk = {
+		{ 0x90 },                                           // nop
+		{ 0x66, 0x90 },                                    // xchg ax,ax (2-byte nop)
+		{ 0x0F, 0x1F, 0x00 },                             // nop [rax]
+		{ 0x0F, 0x1F, 0x40, 0x00 },                      // nop [rax+0]
+		{ 0x40, 0x0F, 0x1F, 0x00 },                      // rex.nop [rax]
+		{ 0x45, 0x0F, 0x1F, 0xC0 },                      // nop r8/r9/r10/r11
+	};
+
+	std::vector<std::vector<uint8_t>> post_junk = {
+		{ 0x90 },                                           // nop
+		{ 0x66, 0x90 },                                    // xchg ax,ax
+		{ 0x0F, 0x1F, 0x44, 0x00, 0x00 },                // nop [rax+rax*1]
+		{ 0x4D, 0x0F, 0x1F, 0xC0 },                       // nop r8
+		{ 0x41, 0x0F, 0x1F, 0xC0 },                      // nop r8
+		{ 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00 },   // nop [rax+0]
+	};
+
+	// Insert junk BEFORE
+	for (int i = 0; i < before_count; i++) {
+		auto& pattern = pre_junk[gen() % pre_junk.size()];
+		instruction_t junk = make_junk_instr(function->func_id, pattern);
+		instruction = function->instructions.insert(instruction, junk);
+		instruction++;
+	}
+
+	// Insert junk AFTER
+	for (int i = 0; i < after_count; i++) {
+		auto& pattern = post_junk[gen() % post_junk.size()];
+		instruction_t junk = make_junk_instr(function->func_id, pattern);
+		instruction++;
+		instruction = function->instructions.insert(instruction, junk);
+	}
+
+	return true;
+}

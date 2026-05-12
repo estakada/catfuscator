@@ -112,12 +112,12 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <DisableSpecificWarnings>4996</DisableSpecificWarnings>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)extern\zydis\include;$(ProjectDir)extern\zydis\dependencies\zycore\include;$(ProjectDir)extern\asmjit\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\extern\zydis\include;$(ProjectDir)..\extern\zydis\dependencies\zycore\include;$(ProjectDir)..\extern\asmjit\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(ProjectDir)extern\zydis\build\Release;$(ProjectDir)extern\zydis\build\zycore\Release;$(ProjectDir)extern\asmjit\build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\extern\zydis\build\Release;$(ProjectDir)..\extern\zydis\build\zycore\Release;$(ProjectDir)..\extern\asmjit\build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Zydis.lib;Zycore.lib;asmjit.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -132,14 +132,14 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)extern\zydis\include;$(ProjectDir)extern\zydis\dependencies\zycore\include;$(ProjectDir)extern\asmjit\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\extern\zydis\include;$(ProjectDir)..\extern\zydis\dependencies\zycore\include;$(ProjectDir)..\extern\asmjit\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(ProjectDir)extern\zydis\build\Release;$(ProjectDir)extern\zydis\build\zycore\Release;$(ProjectDir)extern\asmjit\build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\extern\zydis\build\Release;$(ProjectDir)..\extern\zydis\build\zycore\Release;$(ProjectDir)..\extern\asmjit\build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>Zydis.lib;Zycore.lib;asmjit.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>

@@ -743,6 +743,9 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 				if (randval <= 2) {
 					this->add_junk(func, instruction);
 				}
+
+				// Wrap JMP/CALL with junk instructions
+				this->wrap_jmp_call_junk(func, instruction);
 			}
 
 
