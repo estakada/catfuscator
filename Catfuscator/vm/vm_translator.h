@@ -119,6 +119,13 @@ private:
 	bool translate_alu_reg_imm(vm_op op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
 	bool translate_alu_mem(vm_op reg_reg_op, vm_op reg_imm_op, const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);
 
+	// RIP-relative memory helper: for SSE/scalar loads/stores where mem.base==RIP.
+	// Emits PUSH+MOV_REG_IMM64(rva)+RELOCATE_REG so out_base holds runtime abs addr.
+	// Returns true if RIP-relative; caller uses out_base with disp=0 and must call rip_relative_pop.
+	bool rip_relative_setup(const ZydisDecodedOperand& mem_op,
+		const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc, uint8_t& out_base);
+	void rip_relative_pop(uint8_t base, std::vector<uint8_t>& bc);
+
 	// SSE
 	bool map_xmm_register(ZydisRegister reg, uint8_t& out_xmm_idx);
 	bool translate_sse_mov(const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc);

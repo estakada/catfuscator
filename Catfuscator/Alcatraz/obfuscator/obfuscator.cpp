@@ -651,6 +651,7 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 		throw std::runtime_error("couldn't analyze functions");
 	printf("[dbg] analyze_functions OK\n"); fflush(stdout);
 
+
 	*(uint32_t*)(pe->get_buffer()->data() + new_section->VirtualAddress) = _rotl(pe->get_nt()->OptionalHeader.AddressOfEntryPoint, pe->get_nt()->FileHeader.TimeDateStamp) ^ pe->get_nt()->OptionalHeader.SizeOfStackCommit;
 
 	code.init(rt.environment());
@@ -733,27 +734,28 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 			if (func->movobf) {
 				if (instruction->zyinstr.info.mnemonic == ZYDIS_MNEMONIC_MOV)
 				{
-					// Try constant folding first (non-JIT, inserts decoded instructions)
-					// If it succeeds, skip the JIT-based obfuscate_mov
-					if (!this->obfuscate_constant(func, instruction))
-						this->obfuscate_mov(func, instruction);
+					this->obfuscate_mov(func, instruction);
 				}
 			}
 
-			// Antidisassembly junk
 			if (func->antidisassembly) {
 				int randval = rand() % 8 + 1;
+
 				if (randval <= 2) {
 					this->add_junk(func, instruction);
 				}
-				// DISABLED: wrap_jmp_call_junk breaks the obfuscation pipeline
-				// this->wrap_jmp_call_junk(func, instruction);
 			}
-
 
 		}
 
-	}
+		// Append dead code blocks once per function, after the last real instruction.
+		// Dead code lives in the function's tail — never inserted mid-stream.
+		if (func->antidisassembly) {
+			int dce_roll = rand() % 8;
+			if (dce_roll == 0 && !func->instructions.empty()) {
+				this->add_dead_code_after_last(func, (int)func->instructions.size() - 1);
+			}
+		}	}
 
 	this->relocate(new_section);
 

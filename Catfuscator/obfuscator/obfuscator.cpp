@@ -651,6 +651,7 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 		throw std::runtime_error("couldn't analyze functions");
 	printf("[dbg] analyze_functions OK\n"); fflush(stdout);
 
+
 	*(uint32_t*)(pe->get_buffer()->data() + new_section->VirtualAddress) = _rotl(pe->get_nt()->OptionalHeader.AddressOfEntryPoint, pe->get_nt()->FileHeader.TimeDateStamp) ^ pe->get_nt()->OptionalHeader.SizeOfStackCommit;
 
 	code.init(rt.environment());

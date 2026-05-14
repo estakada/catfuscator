@@ -2776,6 +2776,37 @@ bool vm_translator::map_xmm_register(ZydisRegister reg, uint8_t& out_xmm_idx) {
 	return false;
 }
 
+// Helper: if `mem_op` is RIP-relative, emit PUSH+MOV_IMM64+RELOCATE for a scratch
+// vreg holding the runtime absolute address. Caller then uses `out_base` as the
+// base register (with disp=0) and must call rip_relative_pop afterwards.
+// Returns true if RIP-relative setup was emitted (caller uses disp=0), false if
+// not RIP-relative (caller uses normal mapping).
+bool vm_translator::rip_relative_setup(const ZydisDecodedOperand& mem_op,
+	const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc, uint8_t& out_base) {
+	if (mem_op.mem.base != ZYDIS_REGISTER_RIP) return false;
+
+	// RVA in the image = abs_target_in_buffer - buffer_base
+	uint64_t target_rva = inst.location_of_data - buffer_base;
+	out_base = table.gp_perm[15]; // permuted index for VR15 (safe scratch — push/pop saves original)
+
+	emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
+	emit_byte(bc, out_base);
+
+	emit_u16(bc, table.encode_random(vm_op::VM_MOV_REG_IMM64, junk_rng));
+	emit_byte(bc, out_base);
+	emit_u64(bc, target_rva ^ imm_xor_key);
+
+	// RELOCATE_REG adds R14 (runtime image base) → out_base now holds runtime abs addr
+	emit_u16(bc, table.encode_random(vm_op::VM_RELOCATE_REG, junk_rng));
+	emit_byte(bc, out_base);
+	return true;
+}
+
+void vm_translator::rip_relative_pop(uint8_t base, std::vector<uint8_t>& bc) {
+	emit_u16(bc, table.encode_random(vm_op::VM_POP_REG, junk_rng));
+	emit_byte(bc, base);
+}
+
 bool vm_translator::translate_sse_mov(const obfuscator::instruction_t& inst, std::vector<uint8_t>& bc) {
 	auto& ops = inst.zyinstr.operands;
 	auto mn = inst.zyinstr.info.mnemonic;
@@ -2801,20 +2832,34 @@ bool vm_translator::translate_sse_mov(const obfuscator::instruction_t& inst, std
 		uint8_t dst;
 		if (!map_xmm_register(ops[0].reg.value, dst)) return false;
 		uint8_t base_vreg, sz;
-		if (!map_register(ops[1].mem.base, base_vreg, sz)) return false;
+		uint8_t rip_scratch;
+		bool rip_rel = rip_relative_setup(ops[1], inst, bc, rip_scratch);
+		if (rip_rel) {
+			base_vreg = rip_scratch;
+		} else if (!map_register(ops[1].mem.base, base_vreg, sz)) {
+			return false;
+		}
 		emit_u16(bc, table.encode_random(rm_op, junk_rng));
 		emit_byte(bc, dst);
 		emit_byte(bc, base_vreg);
-		emit_i32(bc, static_cast<int32_t>(ops[1].mem.disp.value));
+		emit_i32(bc, rip_rel ? 0 : static_cast<int32_t>(ops[1].mem.disp.value));
+		if (rip_rel) rip_relative_pop(rip_scratch, bc);
 	} else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
 		uint8_t src;
 		if (!map_xmm_register(ops[1].reg.value, src)) return false;
 		uint8_t base_vreg, sz;
-		if (!map_register(ops[0].mem.base, base_vreg, sz)) return false;
+		uint8_t rip_scratch;
+		bool rip_rel = rip_relative_setup(ops[0], inst, bc, rip_scratch);
+		if (rip_rel) {
+			base_vreg = rip_scratch;
+		} else if (!map_register(ops[0].mem.base, base_vreg, sz)) {
+			return false;
+		}
 		emit_u16(bc, table.encode_random(mr_op, junk_rng));
 		emit_byte(bc, base_vreg);
-		emit_i32(bc, static_cast<int32_t>(ops[0].mem.disp.value));
+		emit_i32(bc, rip_rel ? 0 : static_cast<int32_t>(ops[0].mem.disp.value));
 		emit_byte(bc, src);
+		if (rip_rel) rip_relative_pop(rip_scratch, bc);
 	} else return false;
 	return true;
 }

@@ -121,19 +121,38 @@ PIMAGE_SECTION_HEADER pe64::create_section(std::string name, uint32_t size, uint
 
 void pe64::save_to_disk(std::string path, PIMAGE_SECTION_HEADER new_section, uint32_t total_size) {
 
+	auto nt = this->get_nt();
+	auto* opt = &nt->OptionalHeader;
 
-	uint32_t size = this->align(total_size, this->get_nt()->OptionalHeader.SectionAlignment);
+	uint32_t size = this->align(total_size, opt->SectionAlignment);
 
 	uint32_t original_size = new_section->Misc.VirtualSize;
 	new_section->SizeOfRawData = size;
 	new_section->Misc.VirtualSize = size;
-	this->get_nt()->OptionalHeader.SizeOfImage -= (original_size - size);
+	opt->SizeOfImage -= (original_size - size);
+
+	// `buffer` is laid out by virtual address (see ctor). To produce a valid PE
+	// on disk we set PointerToRawData = VirtualAddress for every section so the
+	// loader reads section content from the right offsets. We DO NOT bump
+	// FileAlignment or SizeOfHeaders — bumping SizeOfHeaders would make the loader
+	// pull extra bytes into the in-memory headers page, breaking any anti-tamper
+	// hash of the loaded image.
+	// NOTE: pe64::align() unconditionally adds alignment, even when already aligned.
+	// Use proper round-up here so SizeOfRawData never exceeds SizeOfImage.
+	auto align_up = [](uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); };
+
+	auto first_section = IMAGE_FIRST_SECTION(nt);
+	for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+		auto* s = &first_section[i];
+		s->PointerToRawData = s->VirtualAddress;
+		s->SizeOfRawData = align_up(s->Misc.VirtualSize, opt->FileAlignment);
+	}
 
 	std::ofstream file_stream(path.c_str(), std::ios_base::out | std::ios_base::binary);
 	if (!file_stream)
 		throw std::runtime_error("couldn't open output binary!");
 
-	if (!file_stream.write((char*)this->buffer.data(), this->get_nt()->OptionalHeader.SizeOfImage)) {
+	if (!file_stream.write((char*)this->buffer.data(), opt->SizeOfImage)) {
 		file_stream.close();
 		throw std::runtime_error("couldn't write output binary!");
 	}
@@ -198,32 +217,97 @@ std::vector<encrypted_string> pe64::encrypt_strings(uint32_t seed) {
 	uint32_t rdata_size = rdata->Misc.VirtualSize;
 	uint8_t* rdata_ptr = buffer.data() + rdata_rva;
 
-	// Get import directory range to skip
 	auto nt = get_nt();
-	auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-	auto& iat_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
-	auto& debug_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+	auto& dirs = nt->OptionalHeader.DataDirectory;
 
-	auto in_range = [](uint32_t addr, uint32_t start, uint32_t size) {
-		return addr >= start && addr < start + size;
+	// Forbidden RVA ranges that must not be touched: their bytes are read by
+	// the Windows loader BEFORE our decryption stub runs at the entry point.
+	std::vector<std::pair<uint32_t, uint32_t>> forbidden;
+	auto add = [&](uint32_t r, uint32_t s) { if (s) forbidden.push_back({ r, s }); };
+
+	// Data directories whose payload lives in .rdata and is consumed pre-EP
+	add(dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress,        dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress,           dirs[IMAGE_DIRECTORY_ENTRY_IAT].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress,         dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress,  dirs[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress,  dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress,   dirs[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress,           dirs[IMAGE_DIRECTORY_ENTRY_TLS].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress,     dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size);
+	add(dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress,     dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
+
+	// Walk import descriptors and forbid every byte the loader touches:
+	// DLL name strings, ILT/INT arrays, and IMAGE_IMPORT_BY_NAME structures.
+	auto& import_dir = dirs[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (import_dir.VirtualAddress && import_dir.Size) {
+		auto desc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(buffer.data() + import_dir.VirtualAddress);
+		while (desc->Name != 0) {
+			const char* dll_name = reinterpret_cast<const char*>(buffer.data() + desc->Name);
+			add(desc->Name, static_cast<uint32_t>(strlen(dll_name)) + 1);
+
+			uint32_t ilt_rva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+			if (ilt_rva) {
+				auto ilt = reinterpret_cast<PIMAGE_THUNK_DATA64>(buffer.data() + ilt_rva);
+				uint32_t count = 0;
+				while (ilt[count].u1.AddressOfData != 0) {
+					if (!(ilt[count].u1.Ordinal & IMAGE_ORDINAL_FLAG64)) {
+						uint32_t hn_rva = static_cast<uint32_t>(ilt[count].u1.AddressOfData);
+						auto hn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(buffer.data() + hn_rva);
+						uint32_t name_len = static_cast<uint32_t>(strlen(reinterpret_cast<char*>(hn->Name))) + 1;
+						add(hn_rva, sizeof(WORD) + name_len);
+					}
+					count++;
+				}
+				add(ilt_rva, (count + 1) * static_cast<uint32_t>(sizeof(IMAGE_THUNK_DATA64)));
+			}
+			desc++;
+		}
+	}
+
+	// Same for delay-load imports (ImgDelayDescr layout)
+	auto& delay_dir = dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+	if (delay_dir.VirtualAddress && delay_dir.Size) {
+		struct delay_desc { uint32_t attrs, name_rva, hmod_rva, iat_rva, int_rva, biat_rva, uiat_rva, timestamp; };
+		auto* d = reinterpret_cast<delay_desc*>(buffer.data() + delay_dir.VirtualAddress);
+		while (d->name_rva != 0) {
+			const char* dll_name = reinterpret_cast<const char*>(buffer.data() + d->name_rva);
+			add(d->name_rva, static_cast<uint32_t>(strlen(dll_name)) + 1);
+			if (d->int_rva) {
+				auto ilt = reinterpret_cast<PIMAGE_THUNK_DATA64>(buffer.data() + d->int_rva);
+				uint32_t count = 0;
+				while (ilt[count].u1.AddressOfData != 0) {
+					if (!(ilt[count].u1.Ordinal & IMAGE_ORDINAL_FLAG64)) {
+						uint32_t hn_rva = static_cast<uint32_t>(ilt[count].u1.AddressOfData);
+						auto hn = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(buffer.data() + hn_rva);
+						uint32_t name_len = static_cast<uint32_t>(strlen(reinterpret_cast<char*>(hn->Name))) + 1;
+						add(hn_rva, sizeof(WORD) + name_len);
+					}
+					count++;
+				}
+				add(d->int_rva, (count + 1) * static_cast<uint32_t>(sizeof(IMAGE_THUNK_DATA64)));
+			}
+			d++;
+		}
+	}
+
+	auto in_forbidden = [&](uint32_t rva) {
+		for (auto& f : forbidden)
+			if (rva >= f.first && rva < f.first + f.second) return true;
+		return false;
 	};
 
 	// Scan for null-terminated ASCII strings (>= 4 printable chars)
 	uint32_t i = 0;
 	while (i < rdata_size) {
 		uint32_t str_rva = rdata_rva + i;
-
-		// Skip import/IAT/debug directory regions
-		if ((import_dir.Size && in_range(str_rva, import_dir.VirtualAddress, import_dir.Size)) ||
-			(iat_dir.Size && in_range(str_rva, iat_dir.VirtualAddress, iat_dir.Size)) ||
-			(debug_dir.Size && in_range(str_rva, debug_dir.VirtualAddress, debug_dir.Size))) {
+		if (in_forbidden(str_rva)) {
 			i++;
 			continue;
 		}
 
-		// Check for printable ASCII string
 		uint32_t start = i;
-		while (i < rdata_size && rdata_ptr[i] >= 0x20 && rdata_ptr[i] <= 0x7E)
+		while (i < rdata_size && !in_forbidden(rdata_rva + i)
+			&& rdata_ptr[i] >= 0x20 && rdata_ptr[i] <= 0x7E)
 			i++;
 
 		uint32_t len = i - start;
@@ -231,7 +315,6 @@ std::vector<encrypted_string> pe64::encrypt_strings(uint32_t seed) {
 			uint32_t key = rng();
 			if (key == 0) key = 0xDEADBEEF;
 
-			// Rolling XOR encrypt
 			uint32_t rolling = key;
 			for (uint32_t j = 0; j < len; j++) {
 				rdata_ptr[start + j] ^= static_cast<uint8_t>(rolling);

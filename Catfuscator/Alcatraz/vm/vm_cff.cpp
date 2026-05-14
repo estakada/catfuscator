@@ -543,6 +543,11 @@ bool vm_cff::flatten(std::vector<uint8_t>& bytecode) {
 		result.insert(result.end(), code.begin(), code.end());
 	}
 
+	// Step 9: Inject fake CFG edges (unreachable conditional jumps after real jumps)
+	if (enable_fake_edges && result.size() > 4) {
+		inject_fake_cfg_edges(result, block_position, block_offsets, out_blocks, order, blocks.size());
+	}
+
 	printf("[vm_cff] flattened: %zu blocks, %zu -> %zu bytes\n",
 		blocks.size(), bytecode.size(), result.size());
 	bytecode = std::move(result);
@@ -555,6 +560,19 @@ void vm_cff::inject_fake_cfg_edges(std::vector<uint8_t>& bytecode, const std::ve
 
 	if (block_count < 2) return;
 
+	// Find positions right after each block's last real JMP.
+	// We scan the assembled bytecode and track block boundaries.
+	// After each block's end, right before the next block, insert a fake JZ.
+	// The fake JZ is placed AFTER the block's real control flow but BEFORE
+	// the next block starts — so it looks like valid code to the disassembler
+	// but is never reached because the previous block's jump already transferred control.
+	// However: that's tricky to get right since we'd need to split blocks.
+	// Safer approach: insert fake edges as dead code AFTER each block's terminal jump
+	// (unconditional JMP or fall-through JMP). The VM dispatches to the next block
+	// and never re-enters the current block, so the fake code is unreachable.
+	// RE sees it as valid CFG edges.
+
+	// Iterate over each block's output in layout order
 	uint32_t pos = 0;
 	for (size_t i = 0; i < block_count; i++) {
 		uint32_t block_size = static_cast<uint32_t>(out_blocks[i].code.size());
@@ -563,19 +581,30 @@ void vm_cff::inject_fake_cfg_edges(std::vector<uint8_t>& bytecode, const std::ve
 			continue;
 		}
 
+		// Decide if this block gets a fake edge
 		if (rng() % 100 < fake_edge_pct) {
+			// Pick a random target block (any valid block)
 			int target_block = rng() % block_count;
+
+			// Emit fake edge: TEST to clear Z flag, then JZ to target
+			// TEST with non-zero operand always clears Z → JZ never branches
 			uint16_t test_op = table.encode(vm_op::VM_TEST_REG_IMM);
 			uint16_t jz_op = table.encode(vm_op::VM_JZ);
+
+			// Pick a scratch register that looks normal
 			uint8_t vreg = static_cast<uint8_t>(rng() % 16);
 
+			// TEST vreg, 1   → sets Z=0 (since 1 != 0), non-destructive
 			uint8_t fake_data[8] = {
 				static_cast<uint8_t>(test_op & 0xFF), static_cast<uint8_t>((test_op >> 8) & 0xFF),
-				vreg, 1, 0, 0, 0, 8
+				vreg,
+				1, 0, 0, 0,  // imm32 = 1
+				8             // size
 			};
 
+			// Compute JZ offset
 			uint32_t target_abs = block_offsets[target_block];
-			uint32_t jz_offset_pos = pos + block_size + 2 + 4;
+			uint32_t jz_offset_pos = pos + block_size + 2 + 4; // after block + test (2) + jz opcode (2) = rel offset pos
 			uint32_t jz_abs = jz_offset_pos + 4;
 			int32_t rel = static_cast<int32_t>(target_abs) - static_cast<int32_t>(jz_abs);
 
@@ -587,6 +616,7 @@ void vm_cff::inject_fake_cfg_edges(std::vector<uint8_t>& bytecode, const std::ve
 				static_cast<uint8_t>((rel >> 24) & 0xFF)
 			};
 
+			// Insert fake edge after the block
 			auto it = bytecode.begin() + pos + block_size;
 			bytecode.insert(it, fake_data, fake_data + 8);
 			bytecode.insert(bytecode.begin() + pos + block_size + 8, jz_data, jz_data + 6);

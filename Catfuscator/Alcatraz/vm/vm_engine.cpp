@@ -19,8 +19,27 @@ void vm_engine::generate_key(uint32_t region_seed) {
 }
 
 void vm_engine::encrypt_bytecode(std::vector<uint8_t>& bytecode) {
-	for (size_t i = 0; i < bytecode.size(); i++)
-		bytecode[i] ^= encrypt_key[i % ENCRYPT_KEY_SIZE];
+	rc4_crypt(bytecode.data(), bytecode.size(), encrypt_key, ENCRYPT_KEY_SIZE);
+}
+
+void vm_engine::rc4_crypt(uint8_t* data, size_t len, const uint8_t* key, int key_len) {
+	// RC4 Key Scheduling Algorithm
+	uint8_t S[256];
+	for (int i = 0; i < 256; i++) S[i] = static_cast<uint8_t>(i);
+	int j = 0;
+	for (int i = 0; i < 256; i++) {
+		j = (j + S[i] + key[i % key_len]) & 0xFF;
+		std::swap(S[i], S[j]);
+	}
+	// RC4 Pseudo-Random Generation Algorithm + XOR
+	int ii = 0, jj = 0;
+	for (size_t k = 0; k < len; k++) {
+		ii = (ii + 1) & 0xFF;
+		jj = (jj + S[ii]) & 0xFF;
+		std::swap(S[ii], S[jj]);
+		int t = (S[ii] + S[jj]) & 0xFF;
+		data[k] ^= S[t];
+	}
 }
 
 static int get_opcode_operand_size(uint16_t opcode, const vm_opcode_table& table) {
@@ -434,7 +453,7 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 		vm_dispatcher inner_dispatcher(inner_table);
 		inner_dispatcher.generate(inner_dispatcher_code, inner_key, ENCRYPT_KEY_SIZE,
 			inner_bc_size, inner_imm_xor_key, &settings, inner_context_seed, image_base,
-			true);
+			true, nullptr);
 	}
 
 	// --- Outer bytecode ---
@@ -755,7 +774,7 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 
 	std::vector<uint8_t> dispatcher_code;
 	if (!dispatcher.generate(dispatcher_code, encrypt_key, ENCRYPT_KEY_SIZE, bytecode_size,
-		imm_xor_key, &settings, context_seed, image_base)) {
+		imm_xor_key, &settings, context_seed, image_base, false, bytecode.data())) {
 		printf("[vm_engine] failed to generate dispatcher\n");
 		return false;
 	}

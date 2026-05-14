@@ -18,7 +18,7 @@ public:
 		const uint8_t* key = nullptr, int key_size = 0, uint32_t bytecode_size = 0,
 		uint64_t imm_xor_key = 0, const vm_settings* settings = nullptr,
 		uint32_t context_seed = 0, uint64_t image_base = 0,
-		bool nested_mode = false);
+		bool nested_mode = false, const uint8_t* bytecode_data = nullptr);
 
 	uint32_t get_dispatcher_size() const;
 
@@ -32,6 +32,11 @@ private:
 	uint64_t compile_image_base;
 	bool nested_mode;
 	uint64_t inner_dispatcher_rva;
+	const uint8_t* dispatch_key = nullptr;
+	int dispatch_key_size = 0;
+	const uint8_t* bytecode_data = nullptr;
+	uint32_t bytecode_checksum = 0;
+	uint32_t bytecode_size_for_checksum = 0;
 public:
 	void set_inner_dispatcher_rva(uint64_t rva) { inner_dispatcher_rva = rva; }
 private:
@@ -44,12 +49,22 @@ private:
 		asmjit::Label exit_label;
 		asmjit::Label handlers[static_cast<int>(vm_op::VM_COUNT)];
 		asmjit::Label dup_handlers[vm_opcode_table::TOTAL_DUPS];
+		// Jump table dispatch: resolved handler offsets (populated post-assembly)
+		std::vector<uint32_t> handler_offsets;
+		// jt_table label (needed for post-processing offset resolution)
+		asmjit::Label jt_table_label;
+		// Junk handlers: fake opcode handlers that are never dispatched to
+		std::vector<asmjit::Label> junk_handlers;
 	};
 
 	void emit_enter_handler(asmjit::x86::Assembler& a, handler_labels& labels,
 		const uint8_t* key, int key_size, uint32_t bytecode_size, uint64_t imm_xor_key);
 	void emit_exit_handler(asmjit::x86::Assembler& a, handler_labels& labels);
-	void emit_dispatch_loop(asmjit::x86::Assembler& a, handler_labels& labels);
+	void emit_dispatch_loop(asmjit::x86::Assembler& a, handler_labels& labels,
+		const uint8_t* key, int key_size);
+
+	// Junk handlers: fake opcode handlers never dispatched to, pollute RE analysis
+	void emit_junk_handler(asmjit::x86::Assembler& a, handler_labels& labels, int idx);
 
 	// Opcode handlers
 	void emit_nop_handler(asmjit::x86::Assembler& a, handler_labels& labels);
@@ -174,6 +189,10 @@ private:
 
 	// Handler chaining: inline dispatch instead of jmp dispatch_loop
 	void emit_chain_dispatch(asmjit::x86::Assembler& a, handler_labels& labels);
+
+	// Indirect dispatch: polynomial handler lookup without plaintext jump table
+	bool emit_indirect_dispatch(asmjit::x86::Assembler& a, handler_labels& labels,
+		const uint8_t* key, int key_size);
 
 	// Handler mutation: per-region polymorphism
 	void emit_handler_entry_junk(asmjit::x86::Assembler& a);
