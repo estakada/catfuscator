@@ -336,7 +336,8 @@ std::vector<encrypted_string> pe64::encrypt_strings(uint32_t seed) {
 }
 
 std::vector<uint8_t> pe64::generate_string_decrypt_stub(
-	uint32_t table_rva, uint32_t entry_count, uint32_t orig_ep_rva) {
+	uint32_t table_rva, uint32_t entry_count, uint32_t orig_ep_rva,
+	uint32_t stub_rva) {
 	// Native x86-64 stub that:
 	// 1. Gets ImageBase from PEB (gs:[0x60] → PEB → ImageBase)
 	// 2. Iterates string table, XOR-decrypts each string
@@ -449,11 +450,33 @@ std::vector<uint8_t> pe64::generate_string_decrypt_stub(
 	code.clear();
 
 	// ===== STUB START =====
-	// Get ImageBase
-	// 65 48 8B 04 25 60 00 00 00    mov rax, gs:[0x60]
-	emit({ 0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00 });
-	// 48 8B 40 10                    mov rax, [rax+0x10]
-	emit({ 0x48, 0x8B, 0x40, 0x10 });
+	// DLL safety: preserve DllMain args (rcx=hModule, rdx=reason, r8=reserved).
+	// Windows loader calls the entry point with these args, and a DLL whose stub
+	// trashes them will get garbage in DllMain → FALSE return → LoadLibrary fails.
+	// 51                             push rcx
+	emit({ 0x51 });
+	// 52                             push rdx
+	emit({ 0x52 });
+	// 41 50                          push r8
+	emit({ 0x41, 0x50 });
+
+	// Get the *current module's* ImageBase via RIP-relative LEA.
+	// We CANNOT use PEB.ImageBaseAddress (gs:[0x60]+0x10): that holds the
+	// main EXE's base, which is wrong when the stub runs inside a DLL.
+	//
+	// lea rax, [rip + disp32]  encodes as:  48 8D 05 disp32
+	// After the instruction, RIP = current_address + 7
+	//                            = ImageBase + (stub_rva + lea_end_offset_in_stub)
+	// We want rax = ImageBase, so:
+	//   disp32 = -(stub_rva + lea_end_offset_in_stub)
+	//
+	// lea_end_offset_in_stub = current code.size() + 7  (3 push bytes already
+	// emitted: 51, 52, 41 50  → code.size() == 4 here, lea ends at offset 11)
+	{
+		uint32_t lea_end_offset = (uint32_t)code.size() + 7;
+		int32_t disp = -(int32_t)(stub_rva + lea_end_offset);
+		emit({ 0x48, 0x8D, 0x05 }); emit32((uint32_t)disp);
+	}
 	// 50                             push rax  (ImageBase on stack)
 	emit({ 0x50 });
 
@@ -550,6 +573,13 @@ std::vector<uint8_t> pe64::generate_string_decrypt_stub(
 
 	// pop rax              ; ImageBase
 	emit({ 0x58 });
+	// Restore DllMain args (reverse push order)
+	// 41 58                pop r8
+	emit({ 0x41, 0x58 });
+	// 5A                   pop rdx
+	emit({ 0x5A });
+	// 59                   pop rcx
+	emit({ 0x59 });
 	// lea rax, [rax + orig_ep_rva]
 	// 48 8D 80 xx xx xx xx
 	emit({ 0x48, 0x8D, 0x80 }); emit32(orig_ep_rva);

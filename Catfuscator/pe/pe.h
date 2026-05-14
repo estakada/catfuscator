@@ -50,8 +50,12 @@ public:
 	// String encryption: find and encrypt ASCII strings in .rdata
 	std::vector<encrypted_string> encrypt_strings(uint32_t seed);
 
-	// Generate decryption stub that decrypts strings and jumps to original EP
-	// Returns stub bytes; table_rva and orig_ep_rva are embedded
+	// Generate decryption stub that decrypts strings and jumps to original EP.
+	// stub_rva is the RVA where the stub will be placed in the image — required
+	// so the stub can compute its own module's ImageBase via RIP-relative LEA
+	// (PEB.ImageBaseAddress only works for the main EXE, not for DLLs).
+	// Returns stub bytes; table_rva, stub_rva and orig_ep_rva are embedded.
 	static std::vector<uint8_t> generate_string_decrypt_stub(
-		uint32_t table_rva, uint32_t entry_count, uint32_t orig_ep_rva);
+		uint32_t table_rva, uint32_t entry_count, uint32_t orig_ep_rva,
+		uint32_t stub_rva);
 };
