@@ -60,6 +60,7 @@ private:
 	void emit_enter_handler(asmjit::x86::Assembler& a, handler_labels& labels,
 		const uint8_t* key, int key_size, uint32_t bytecode_size, uint64_t imm_xor_key);
 	void emit_exit_handler(asmjit::x86::Assembler& a, handler_labels& labels);
+	void emit_exit_to_rva_handler(asmjit::x86::Assembler& a, handler_labels& labels);
 	void emit_dispatch_loop(asmjit::x86::Assembler& a, handler_labels& labels,
 		const uint8_t* key, int key_size);
 

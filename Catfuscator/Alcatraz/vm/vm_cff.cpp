@@ -41,7 +41,8 @@ bool vm_cff::is_conditional_jump(vm_op op) {
 }
 
 bool vm_cff::is_exit_op(vm_op op) {
-	return op == vm_op::VM_EXIT || op == vm_op::VM_JMP_REG || op == vm_op::VM_JMP_MEM;
+	return op == vm_op::VM_EXIT || op == vm_op::VM_EXIT_TO_RVA
+		|| op == vm_op::VM_JMP_REG || op == vm_op::VM_JMP_MEM;
 }
 
 int vm_cff::get_instruction_size(const std::vector<uint8_t>& bc, uint32_t offset) {
@@ -309,10 +310,11 @@ int vm_cff::get_instruction_size(const std::vector<uint8_t>& bc, uint32_t offset
 	case vm_op::VM_CMPXCHG_MEM_REG:
 		base_size = 9; break;
 
-	// 10 bytes: CALL_NATIVE / CALL_NATIVE_RELOC / CALL_IMPORT: addr64
+	// 10 bytes: CALL_NATIVE / CALL_NATIVE_RELOC / CALL_IMPORT / EXIT_TO_RVA: addr64
 	case vm_op::VM_CALL_NATIVE:
 	case vm_op::VM_CALL_NATIVE_RELOC:
 	case vm_op::VM_CALL_IMPORT:
+	case vm_op::VM_EXIT_TO_RVA:
 		base_size = 10; break;
 
 	// 10 bytes: LEA_SIB: dst + base + index + scale + disp32
@@ -375,6 +377,12 @@ bool vm_cff::flatten(std::vector<uint8_t>& bytecode) {
 			int32_t rel;
 			memcpy(&rel, &bytecode[inst.offset + inst.size - 4], 4);
 			uint32_t target = inst.offset + inst.size + rel;
+			// CFF bytecode parser can have false-positive opcode decodes inside
+			// imm/data bytes of valid instructions. Skip jumps whose target is
+			// outside bytecode (they're not real jumps even if decoded as such).
+			if (target > bytecode.size()) {
+				continue;
+			}
 			block_starts.insert(target);
 
 			// Instruction after the jump starts a new block

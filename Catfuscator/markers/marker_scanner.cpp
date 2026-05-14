@@ -179,10 +179,35 @@ std::vector<pdbparser::sym_func> marker_scanner::to_sym_funcs(const std::vector<
 	if (!text_section)
 		throw std::runtime_error("marker_scanner: no .text section");
 
+	// Skip regions that are entirely contained inside another region. Without
+	// this, nested markers (e.g. ULTRA inside VIRTUALIZE) get processed twice:
+	// the outer VM blob already includes the inner range, and after VM_EXIT
+	// from the outer dispatcher the native code path then enters the inner
+	// dispatcher AGAIN — re-running side-effectful code (HTTP, JVM calls).
+	// Skip the inner region; outer protection covers it.
+	std::vector<bool> skip(regions.size(), false);
+	for (size_t i = 0; i < regions.size(); i++) {
+		for (size_t j = 0; j < regions.size(); j++) {
+			if (i == j) continue;
+			uint32_t i_end = regions[i].start_rva + regions[i].size;
+			uint32_t j_end = regions[j].start_rva + regions[j].size;
+			// region j strictly contains region i?
+			if (regions[j].start_rva <= regions[i].start_rva && j_end >= i_end &&
+				(regions[j].start_rva != regions[i].start_rva || j_end != i_end)) {
+				skip[i] = true;
+				std::cout << "marker_scanner: skipping " << regions[i].name
+					<< " (nested inside " << regions[j].name << ")" << std::endl;
+				break;
+			}
+		}
+	}
+
 	std::vector<pdbparser::sym_func> funcs;
 	int id = 0;
 
-	for (const auto& region : regions) {
+	for (size_t ri = 0; ri < regions.size(); ri++) {
+		if (skip[ri]) continue;
+		const auto& region = regions[ri];
 		pdbparser::sym_func func{};
 		func.id = id++;
 		func.name = region.name;
@@ -228,10 +253,15 @@ std::vector<pdbparser::sym_func> marker_scanner::to_sym_funcs(const std::vector<
 void marker_scanner::nop_marker_calls(const std::vector<marked_region>& regions) {
 	uint8_t* base = pe->get_buffer()->data();
 
+	// NOP calls for ALL regions (including nested ones we skipped from obfuscation).
+	// Nested CALL marker_xxx stubs are still harmless if left alone, but NOP'ing
+	// is cleaner and faster.
+	int nopped = 0;
 	for (const auto& region : regions) {
 		memset(base + region.begin_call_rva, 0x90, region.begin_call_size);
 		memset(base + region.end_call_rva, 0x90, region.end_call_size);
+		nopped += 2;
 	}
 
-	std::cout << "marker_scanner: NOP'd " << regions.size() * 2 << " marker call(s)" << std::endl;
+	std::cout << "marker_scanner: NOP'd " << nopped << " marker call(s)" << std::endl;
 }

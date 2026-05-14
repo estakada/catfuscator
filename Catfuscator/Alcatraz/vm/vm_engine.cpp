@@ -276,6 +276,7 @@ static int get_opcode_operand_size(uint16_t opcode, const vm_opcode_table& table
 		return 3;
 	case vm_op::VM_RELOCATE_REG: return 1;
 	case vm_op::VM_CALL_NATIVE_RELOC: return 8;
+	case vm_op::VM_EXIT_TO_RVA: return 8;
 	case vm_op::VM_CALL_IMPORT: return 8;
 	case vm_op::VM_NEST_ENTER: return 4;
 	default: return 0;

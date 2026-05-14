@@ -2623,15 +2623,34 @@ bool vm_translator::translate(const std::vector<obfuscator::instruction_t>& inst
 		addr_to_bc[last.runtime_address + last.zyinstr.info.length] = static_cast<uint32_t>(bytecode.size());
 	}
 
-	// Patch jump offsets
+	// Patch jump offsets. External targets (jumps that leave the region) are
+	// handled by emitting a trailing `VM_EXIT_TO_RVA <rva>` stub at the end of
+	// bytecode and patching the offset there. The dispatcher's handler rewrites
+	// the saved return address before standard exit cleanup so the RET jumps
+	// to the native target in .text.
+	std::map<uint64_t, uint32_t> exit_stub_for; // x86 addr → stub bc offset (dedup)
 	for (auto& p : patches) {
 		auto it = addr_to_bc.find(p.target_x86_addr);
+		uint32_t target_bc;
 		if (it == addr_to_bc.end()) {
-			printf("[vm_translator] jump target 0x%llx not found in bytecode map\n", p.target_x86_addr);
-			return false;
+			auto stub_it = exit_stub_for.find(p.target_x86_addr);
+			if (stub_it != exit_stub_for.end()) {
+				target_bc = stub_it->second;
+			} else {
+				if (!buffer_base) {
+					printf("[vm_translator] external jump target 0x%llx but buffer_base unset\n", p.target_x86_addr);
+					return false;
+				}
+				uint64_t target_rva = p.target_x86_addr - buffer_base;
+				target_bc = static_cast<uint32_t>(bytecode.size());
+				emit_u16(bytecode, table.encode_random(vm_op::VM_EXIT_TO_RVA, junk_rng));
+				emit_u64(bytecode, target_rva ^ imm_xor_key);
+				exit_stub_for[p.target_x86_addr] = target_bc;
+			}
+		} else {
+			target_bc = it->second;
 		}
-		// offset = target_bc - (patch_pos + 4), since RSI is already past the 4-byte operand when offset is applied
-		int32_t offset = static_cast<int32_t>(it->second) - static_cast<int32_t>(p.bc_offset + 4);
+		int32_t offset = static_cast<int32_t>(target_bc) - static_cast<int32_t>(p.bc_offset + 4);
 		memcpy(&bytecode[p.bc_offset], &offset, 4);
 	}
 

@@ -146,8 +146,12 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 		}
 	}
 
-	// Build RC4 keystream for TABLE_SIZE bytes
-	uint8_t keystream[256];
+	// Build RC4 keystream for TABLE_SIZE bytes.
+	// NOTE: TABLE_SIZE = TOTAL_ENCODED * 8 (currently ~3KB). Use heap-allocated
+	// vector sized for actual need — original 256-byte stack buffer was a
+	// silent overflow that only manifested once TOTAL_ENCODED crossed a
+	// stack-cookie boundary.
+	std::vector<uint8_t> keystream(TABLE_SIZE);
 	{
 		uint8_t S[256];
 		for (int i = 0; i < 256; i++) S[i] = static_cast<uint8_t>(i);
@@ -346,10 +350,16 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 		}
 
 		// --- Key lookup: embed key as immediate table ---
+		// IMPORTANT: jump OVER the key data; otherwise after the KSA init loop
+		// the CPU falls through and executes random key bytes as instructions.
+		// (Inner-mode VM_ENTER above already does this correctly.)
 		Label key_label = a.newLabel();
+		Label skip_key = a.newLabel();
+		a.jmp(skip_key);
 		a.bind(key_label);
 		for (int ki = 0; ki < key_size; ki++)
 			a.db(key[ki]);
+		a.bind(skip_key);
 
 		// --- KSA: scramble with key (256 iterations) ---
 		{
@@ -540,9 +550,10 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 
 	if (settings && settings->indirect_dispatch) {
 		// --- Indirect dispatch via polynomial lookup ---
-		// R14 = handler table base (PC-relative, computed from first handler label)
+		// IMPORTANT: do NOT clobber R14 — it holds runtime ImageBase used by
+		// VM_RELOCATE_REG / VM_CALL_NATIVE_RELOC / VM_EXIT_TO_RVA. Use RAX as
+		// scratch for handler-table-base instead.
 		a.bind(labels.dispatch_continue);
-		a.lea(r14, x86::ptr(labels.handlers[0])); // PC-relative LEA
 
 		// Compute handler offset: ((A * index + B) & MASK) * STRIDE
 		a.mov(ecx, eax);
@@ -550,7 +561,8 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 		a.add(ecx, Imm(353));   // B = 353
 		a.and_(ecx, Imm(0x7F));  // mask: max 128 handlers
 		a.shl(ecx, 4);          // stride = 16 bytes per handler
-		a.add(rcx, r14);        // rcx = handler_address
+		a.lea(rax, x86::ptr(labels.handlers[0])); // handler table base (PC-relative LEA)
+		a.add(rcx, rax);        // rcx = handler_address
 		a.jmp(rcx);
 		return; // indirect mode: no jump table needed
 	}
@@ -3631,6 +3643,30 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 	a.ret();
 }
 
+void vm_dispatcher::emit_exit_to_rva_handler(x86::Assembler& a, handler_labels& labels) {
+	a.bind(labels.handlers[static_cast<int>(vm_op::VM_EXIT_TO_RVA)]);
+	emit_handler_entry_junk(a);
+
+	// Format: [opcode] [rva:8] (encrypted with imm_xor_key in R12)
+	// target = (rva ^ R12) + R14, then override the saved return address on stack
+	// so the dispatcher's RET (in exit_label cleanup below) jumps to `target`.
+	//
+	// Stack layout at VM_ENTER time (RBX = RSP after `sub rsp, S`):
+	//   [rbx + S + 72]        : saved return address from CALL [dispatcher]
+	//
+	// We rewrite that slot, then jump to the standard exit cleanup. The RET
+	// at the bottom of the exit handler will pop our new target.
+
+	a.mov(rax, qword_ptr(rsi));                          // rax = encrypted RVA
+	emit_poly_advance_ip(a, 8);
+	a.xor_(rax, r12);                                    // decrypt with imm_xor_key
+	a.add(rax, r14);                                     // rax = runtime target = rva + image_base
+
+	a.mov(qword_ptr(rbx, VM_REG_FILE_ALLOC + 72), rax);  // overwrite saved RA
+
+	a.jmp(labels.exit_label);                            // standard cleanup + RET → jumps to `target`
+}
+
 // --- Opaque predicates ---
 // These insert conditional jumps that always go one way at runtime,
 // but static analysis cannot prove which branch is taken.
@@ -4528,6 +4564,7 @@ void vm_dispatcher::build_handler_list(x86::Assembler& a, handler_labels& labels
 	out.push_back([&]() { emit_lea_handler(a, labels); });
 	out.push_back([&]() { emit_imul_reg_reg_handler(a, labels); });
 	out.push_back([&]() { emit_mul_reg_imm_handler(a, labels); });
+	out.push_back([&]() { emit_exit_to_rva_handler(a, labels); });
 
 	// CDQ/CQO/DIV
 	out.push_back([&]() { emit_cdq_handler(a, labels); });
@@ -4814,18 +4851,17 @@ bool vm_dispatcher::emit_indirect_dispatch(asmjit::x86::Assembler& a,
 	Label dispatch_indirect = a.newLabel();
 	a.bind(dispatch_indirect);
 
-	// R14 = handler table base (PC-relative, computed from first handler label)
-	a.lea(r14, x86::ptr(labels.handlers[0]));
-
+	// IMPORTANT: do NOT clobber R14 — it holds runtime ImageBase. Use RAX as
+	// scratch for handler-table-base.
 	// Compute handler offset: ((A * index + B) & MASK) * STRIDE
-	// EAX already has opcode index from dispatch loop
-	// A = 997 (prime), B = 353, stride = 16 (avg handler size)
+	// EAX already has opcode index from dispatch loop — must read it before LEA
 	a.mov(ecx, eax);
 	a.imul(ecx, Imm(997));  // A
 	a.add(ecx, Imm(353));   // B
 	a.and_(ecx, Imm(0x7F));  // mask: max 128 handlers
 	a.shl(ecx, 4);          // stride = 16 bytes per handler
-	a.add(rcx, r14);        // rcx = handler_address
+	a.lea(rax, x86::ptr(labels.handlers[0])); // handler table base
+	a.add(rcx, rax);        // rcx = handler_address
 
 	a.jmp(rcx);
 	return true;

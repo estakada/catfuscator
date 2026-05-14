@@ -390,6 +390,7 @@ enum class vm_op : uint16_t {
 
 	VM_ENTER,            // save real registers -> VM context
 	VM_EXIT,             // restore real registers <- VM context, return to native
+	VM_EXIT_TO_RVA,      // restore + override saved return: [imm64:8] (rva ^ key), runtime target = rva + image_base
 	VM_COUNT
 };
 
