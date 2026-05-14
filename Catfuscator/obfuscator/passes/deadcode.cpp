@@ -11,11 +11,24 @@ static bool try_encode_lea_nop(std::vector<uint8_t>& out) {
 
 static bool try_encode_mov_reg_self(std::vector<uint8_t>& out, uint8_t reg_lo) {
 	out.clear();
-	// REX.B + 89: mov rXX, rXX (self-move = NOP on x64)
-	// Register encoding: 1100 0000 | (reg_disp << 3) | reg
-	uint8_t base = (reg_lo & 7);
+	// MOV r/m64, r64 self-move = NOP on x64.
+	// Correct encoding: REX (with W and possibly R+B for high regs) | 0x89 | ModRM
+	//
+	// PRIOR BUG: emitted only { 0x48, modrm } (2 bytes), missing the 0x89 opcode.
+	// CPU then decoded the next byte as the opcode — typically `0x48 0xC0 <next>`
+	// which is `Shift r/m8, imm8` (opcode C0 with REX.W). This reads/writes at
+	// [reg + disp8] using whatever the following dead-code bytes happen to form,
+	// causing wild access violations roughly proportional to how often this
+	// variant got picked. Per-stage failure rate ~5-10% in regression sweeps.
+	//
+	// REX byte: 0x48 = REX.W; for high regs (8..15) we need REX.R (0x04) for the
+	// source register encoded in ModRM.reg, and REX.B (0x01) for the destination
+	// encoded in ModRM.rm. Source == dest here, so both bits set together.
+	uint8_t rex = 0x48;
+	if ((reg_lo & 8) != 0) rex |= 0x05; // REX.R | REX.B (high reg in reg+rm)
+	uint8_t base = reg_lo & 7;
 	uint8_t modrm = 0xC0 | (base << 3) | base;
-	out = { 0x48, modrm }; // REX.W + modrm
+	out = { rex, 0x89, modrm };
 	return true;
 }
 
@@ -144,7 +157,20 @@ bool obfuscator::add_dead_code(std::vector<obfuscator::function_t>::iterator& fu
 }
 
 // Append dead code blocks after the last real instruction of a function.
-// Uses index-based insertion to avoid iterator invalidation issues.
+//
+// Subtlety: partial (marker-based) functions get a 5-byte JMP-back placeholder
+// (E9 00 00 00 00) appended in analyze_functions(). compile() later locates that
+// placeholder via `last_instruction->relocated_address + length` and overwrites
+// it with the real JMP-to-return-site. If we appended dead code at end() here,
+// the placeholder would be stranded *in the middle* of the function body — the
+// CPU would execute its stale bytes as `jmp +0` (a no-op), fall through dead
+// code, then keep falling into whatever bytes the linker placed next in .cat
+// (often the next function's mutated body, producing a wild crash).
+//
+// Solution: insert dead code BEFORE the placeholder (or BEFORE the end if no
+// placeholder exists). For non-partial functions there's no placeholder, but
+// they exit via a real RET inside the mutated body, so appending dead code
+// after that RET is harmless (the dead code is just never reached).
 bool obfuscator::add_dead_code_after_last(std::vector<obfuscator::function_t>::iterator& function,
 	int after_index) {
 
@@ -154,14 +180,27 @@ bool obfuscator::add_dead_code_after_last(std::vector<obfuscator::function_t>::i
 	int num_blocks = (gen() % 3) + 1;
 	int base_size = (gen() % 10) + 2;
 
+	// Determine insertion point. For partial functions, the last instruction is
+	// the JMP-back placeholder — keep it at the very end and insert dead code
+	// just before it. For non-partial functions, insert at end.
+	bool has_placeholder = function->is_partial && !function->virtualize_vm
+		&& !function->instructions.empty();
+
 	for (int b = 0; b < num_blocks; b++) {
 		int size = base_size + (gen() % 8);
 		auto bytes = generate_dead_code(size);
 		if (bytes.empty()) continue;
 
 		auto dead = make_dead_instr(function->func_id, bytes);
-		// Insert at current end (after previously inserted dead code)
-		function->instructions.insert(function->instructions.end(), dead);
+
+		if (has_placeholder) {
+			// Insert just BEFORE the placeholder (which must remain the last
+			// instruction so compile() can locate it correctly).
+			auto pos = function->instructions.end() - 1;
+			function->instructions.insert(pos, dead);
+		} else {
+			function->instructions.insert(function->instructions.end(), dead);
+		}
 	}
 
 	return true;

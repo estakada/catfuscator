@@ -31,6 +31,10 @@ int main(int args, char* argv[]) {
 	bool use_pdb = true;
 	bool skip_string_encrypt = false;
 	bool string_encrypt_only = false;
+	bool disable_mov = false;
+	bool disable_add = false;
+	bool disable_lea = false;
+	bool disable_antidisasm = false;
 
 	for (int i = 2; i < args; i++) {
 		std::string arg = argv[i];
@@ -50,6 +54,18 @@ int main(int args, char* argv[]) {
 			string_encrypt_only = true;
 			use_markers = false;
 			use_pdb = false;
+		}
+		else if (arg == "--no-mov") {
+			disable_mov = true;
+		}
+		else if (arg == "--no-add") {
+			disable_add = true;
+		}
+		else if (arg == "--no-lea") {
+			disable_lea = true;
+		}
+		else if (arg == "--no-antidisasm") {
+			disable_antidisasm = true;
 		}
 	}
 
@@ -121,6 +137,13 @@ int main(int args, char* argv[]) {
 			}
 			else {
 				auto marker_funcs = scanner.to_sym_funcs(marker_regions);
+				// Optionally disable individual passes for bisection
+				for (auto& mf : marker_funcs) {
+					if (disable_mov)        mf.movobf = false;
+					if (disable_add)        mf.mutateobf = false;  // ADD/SUB mutation gate
+					if (disable_lea)        mf.leaobf = false;
+					if (disable_antidisasm) mf.antidisassembly = false;
+				}
 				functions.insert(functions.end(), marker_funcs.begin(), marker_funcs.end());
 			}
 		}
