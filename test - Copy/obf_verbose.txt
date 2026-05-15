@@ -1,3 +1,0 @@
-marker_scanner: found 1 marker call(s)
-  WARNING: unmatched BEGIN marker at RVA 0x72c4
-No markers found in binary

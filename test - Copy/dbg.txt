@@ -1,7 +1,0 @@
-PDB: parsed 3283 function(s)
-Total functions to process: 3283
-[dbg] run() enter, functions=3110
-[dbg] analyze_functions OK
-OBFUSCATING: 3110
-[string-encrypt] encrypted 240 strings, stub at RVA 0x2F1310
-Finished in 8.945 seconds
