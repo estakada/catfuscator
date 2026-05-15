@@ -12,6 +12,13 @@
 using namespace asmjit;
 
 class obfuscator {
+public:
+	// Diagnostic switches (set via CLI). Used to bisect which sub-pass breaks
+	// downstream code. Each false → that pass is enabled (default behaviour).
+	static inline bool disable_junk = false;
+	static inline bool disable_deadcode = false;
+	static inline bool disable_ff_obf = false;
+
 private:
 	struct instruction_t;
 	struct function_t;
@@ -48,6 +55,13 @@ private:
 	bool find_instruction_by_id(int funcid, int instid, instruction_t* inst);
 
 	bool fix_relative_jmps(function_t* func);
+
+	// Shift relocated_address of the widened instruction (and everything after it
+	// in the same function and in every subsequent function in the .cat layout)
+	// by `delta` bytes. Also bumps total_size_used.
+	void shift_after_widening(function_t* func,
+		std::vector<instruction_t>::iterator widened_inst,
+		int delta);
 
 	bool convert_relative_jmps();
 

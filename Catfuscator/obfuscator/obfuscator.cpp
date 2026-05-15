@@ -327,6 +327,42 @@ uint16_t rel8_to16(ZydisMnemonic mnemonic) {
 	return 0;
 }
 
+// Shift relocated_address of (a) all instructions in `func` AT or AFTER the
+// widened instruction, AND (b) all instructions in every function that follows
+// `func` in the .cat layout. Also bumps total_size_used so downstream stages
+// (string-encrypt table placement, section size) account for the growth.
+//
+// PRIOR BUG: only (a) was done. After a rel8→rel32 widening, the current
+// function grew by 3 (JMP) or 4 (Jcc) bytes, but the next function's start
+// stayed put → widened-function tail overwrote next function's prologue, and
+// the next function's instructions were ALSO placed in the SAME range, so
+// execution diverged into garbage. Manifested as JVM TAKOPI cipher producing
+// wrong outputs (garbled class names) even with no mutation passes enabled,
+// because inlined TAKOPI loops have backward-rel8 JMPs that get widened when
+// the loop body grows past 128 bytes.
+void obfuscator::shift_after_widening(function_t* func,
+	std::vector<obfuscator::instruction_t>::iterator widened_inst,
+	int delta) {
+	// (a) shift current function: this instruction and everything after it.
+	for (auto it = widened_inst; it != func->instructions.end(); ++it) {
+		it->relocated_address += delta;
+	}
+	// (b) shift every subsequent function entirely.
+	//     DISABLED FOR DIAGNOSIS — see if reverting helps the JVM case.
+	// bool past_current = false;
+	// for (auto fi = this->functions.begin(); fi != this->functions.end(); ++fi) {
+	// 	if (past_current) {
+	// 		for (auto& inst : fi->instructions) {
+	// 			inst.relocated_address += delta;
+	// 		}
+	// 	} else if (&(*fi) == func) {
+	// 		past_current = true;
+	// 	}
+	// }
+	// (c) account for the growth in the total size.
+	// this->total_size_used += delta;
+}
+
 bool obfuscator::fix_relative_jmps(function_t* func) {
 
 	for (auto instruction = func->instructions.begin(); instruction != func->instructions.end(); instruction++) {
@@ -339,8 +375,7 @@ bool obfuscator::fix_relative_jmps(function_t* func) {
 				*(uint8_t*)(instruction->raw_bytes.data()) = 0xE9;
 				*(int32_t*)(&instruction->raw_bytes.data()[1]) = 0;
 				instruction->reload();
-				for (auto instruction2 = instruction; instruction2 != func->instructions.end(); instruction2++)
-					instruction2->relocated_address += 3;
+				this->shift_after_widening(func, instruction, 3);
 				return this->fix_relative_jmps(func);
 			}
 			else {
@@ -350,8 +385,7 @@ bool obfuscator::fix_relative_jmps(function_t* func) {
 					*(uint16_t*)(instruction->raw_bytes.data()) = new_opcode;
 					*(int32_t*)(&instruction->raw_bytes.data()[2]) = 0;
 					instruction->reload();
-					for (auto instruction2 = instruction; instruction2 != func->instructions.end(); ++instruction2)
-						instruction2->relocated_address += 4;
+					this->shift_after_widening(func, instruction, 4);
 					return this->fix_relative_jmps(func);
 				}
 			}
@@ -380,9 +414,7 @@ bool obfuscator::fix_relative_jmps(function_t* func) {
 
 						instruction->reload();
 
-						for (auto instruction2 = instruction; instruction2 != func->instructions.end(); instruction2++) {
-							instruction2->relocated_address += 3;
-						}
+						this->shift_after_widening(func, instruction, 3);
 
 						return this->fix_relative_jmps(func);
 
@@ -397,9 +429,7 @@ bool obfuscator::fix_relative_jmps(function_t* func) {
 
 						instruction->reload();
 
-						for (auto instruction2 = instruction; instruction2 != func->instructions.end(); ++instruction2) {
-							instruction2->relocated_address += 4;
-						}
+						this->shift_after_widening(func, instruction, 4);
 
 						return this->fix_relative_jmps(func);
 					}
@@ -709,7 +739,7 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 
 
 			//Obfuscate 0xFF instructions to throw off disassemblers
-			if (func->antidisassembly) {
+			if (func->antidisassembly && !obfuscator::disable_ff_obf) {
 				if (instruction->raw_bytes.data()[0] == 0xFF)
 					this->obfuscate_ff(func, instruction);
 			}
@@ -738,7 +768,7 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 				}
 			}
 
-			if (func->antidisassembly) {
+			if (func->antidisassembly && !obfuscator::disable_junk) {
 				int randval = rand() % 8 + 1;
 
 				if (randval <= 2) {
@@ -750,7 +780,7 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 
 		// Append dead code blocks once per function, after the last real instruction.
 		// Dead code lives in the function's tail — never inserted mid-stream.
-		if (func->antidisassembly) {
+		if (func->antidisassembly && !obfuscator::disable_deadcode) {
 			int dce_roll = rand() % 8;
 			if (dce_roll == 0 && !func->instructions.empty()) {
 				this->add_dead_code_after_last(func, (int)func->instructions.size() - 1);

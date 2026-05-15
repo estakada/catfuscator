@@ -335,9 +335,54 @@ std::vector<encrypted_string> pe64::encrypt_strings(uint32_t seed) {
 	return result;
 }
 
+// Replaces the first entry of the TLS callback array with a pointer to our
+// stub. The original first-callback RVA is returned so the stub can chain to
+// it after decrypting strings. Returns 0 if there is no TLS directory or no
+// callbacks (in which case caller falls back to entry-point patching).
+//
+// Why this is needed for DLLs (and the JVM specifically): the Windows loader
+// calls TLS callbacks BEFORE the DLL entry point. MSVC's __dyn_tls_init runs
+// C++ static initialisers, many of which read string literals in .rdata. If
+// we only patched the entry point, those reads happen on still-encrypted
+// strings -> garbage state in JVM globals -> classfile parser sees nonsense
+// later. Putting our decrypt stub as the FIRST TLS callback fixes this:
+//   slot[0]: our stub (decrypt, then jmp to original __dyn_tls_init)
+//   slot[1]: __dyn_tls_dtor  (unchanged)
+//   slot[N]: NULL terminator (unchanged)
+//
+// We do not need to add new base-relocation entries: slot[0]'s existing reloc
+// entry continues to fire on the (overwritten) value, ASLR-shifting it into
+// the correct loaded address.
+uint32_t pe64::hijack_first_tls_callback(uint32_t stub_rva) {
+	auto nt = get_nt();
+	auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+	if (tls_dir.VirtualAddress == 0 || tls_dir.Size == 0)
+		return 0;
+
+	auto tls = reinterpret_cast<PIMAGE_TLS_DIRECTORY64>(
+		buffer.data() + tls_dir.VirtualAddress);
+	if (tls->AddressOfCallBacks == 0)
+		return 0;
+
+	uint64_t image_base = nt->OptionalHeader.ImageBase;
+	uint32_t callbacks_rva = static_cast<uint32_t>(tls->AddressOfCallBacks - image_base);
+
+	uint64_t* callbacks = reinterpret_cast<uint64_t*>(buffer.data() + callbacks_rva);
+	if (callbacks[0] == 0)
+		return 0;
+
+	uint32_t orig_first_callback_rva = static_cast<uint32_t>(callbacks[0] - image_base);
+
+	// Overwrite slot[0] with our stub's VA. The existing base-relocation entry
+	// for this slot will ASLR-fix it correctly on load.
+	callbacks[0] = image_base + stub_rva;
+
+	return orig_first_callback_rva;
+}
+
 std::vector<uint8_t> pe64::generate_string_decrypt_stub(
 	uint32_t table_rva, uint32_t entry_count, uint32_t orig_ep_rva,
-	uint32_t stub_rva) {
+	uint32_t stub_rva, uint32_t tls_chain_rva) {
 	// Native x86-64 stub that:
 	// 1. Gets ImageBase from PEB (gs:[0x60] → PEB → ImageBase)
 	// 2. Iterates string table, XOR-decrypts each string
@@ -450,15 +495,29 @@ std::vector<uint8_t> pe64::generate_string_decrypt_stub(
 	code.clear();
 
 	// ===== STUB START =====
-	// DLL safety: preserve DllMain args (rcx=hModule, rdx=reason, r8=reserved).
-	// Windows loader calls the entry point with these args, and a DLL whose stub
-	// trashes them will get garbage in DllMain → FALSE return → LoadLibrary fails.
+	// DLL safety: preserve DllMain / TLS-callback args (rcx=hModule,
+	// rdx=reason, r8=reserved). The loader passes these to both entry-point
+	// and TLS-callback signatures; trashing them yields FALSE-return / crash.
 	// 51                             push rcx
 	emit({ 0x51 });
 	// 52                             push rdx
 	emit({ 0x52 });
 	// 41 50                          push r8
 	emit({ 0x41, 0x50 });
+
+	// TLS mode: skip decryption unless reason == DLL_PROCESS_ATTACH (=1).
+	// Otherwise this stub fires on every DLL_THREAD_ATTACH/DETACH and would
+	// re-XOR strings, flipping them back to ciphertext each time.
+	//
+	// 48 83 FA 01    cmp rdx, 1
+	// 0F 85 XX XX XX XX  jne skip_decrypt (rel32, patched later)
+	uint32_t jne_skip_patch = (uint32_t)-1;
+	if (tls_chain_rva != 0) {
+		emit({ 0x48, 0x83, 0xFA, 0x01 });
+		emit({ 0x0F, 0x85 });
+		jne_skip_patch = (uint32_t)code.size();
+		emit32(0); // placeholder
+	}
 
 	// Get the *current module's* ImageBase via RIP-relative LEA.
 	// We CANNOT use PEB.ImageBaseAddress (gs:[0x60]+0x10): that holds the
@@ -573,19 +632,43 @@ std::vector<uint8_t> pe64::generate_string_decrypt_stub(
 
 	// pop rax              ; ImageBase
 	emit({ 0x58 });
-	// Restore DllMain args (reverse push order)
+
+	// TLS mode: patch the jne above so it skips the decrypt loop and lands
+	// here (the args-restore + chain-jmp tail). The jne target is the byte
+	// AFTER the pop rax (we never pushed rax in the skipped path, but we
+	// also fall through to the pops below, so stack is balanced via the
+	// initial 3 pushes only).
+	if (tls_chain_rva != 0) {
+		uint32_t skip_target = (uint32_t)code.size();
+		uint32_t jne_rel = skip_target - (jne_skip_patch + 4);
+		code[jne_skip_patch + 0] = (uint8_t)(jne_rel & 0xFF);
+		code[jne_skip_patch + 1] = (uint8_t)((jne_rel >> 8) & 0xFF);
+		code[jne_skip_patch + 2] = (uint8_t)((jne_rel >> 16) & 0xFF);
+		code[jne_skip_patch + 3] = (uint8_t)((jne_rel >> 24) & 0xFF);
+	}
+
+	// Restore DllMain / TLS args (reverse push order)
 	// 41 58                pop r8
 	emit({ 0x41, 0x58 });
 	// 5A                   pop rdx
 	emit({ 0x5A });
 	// 59                   pop rcx
 	emit({ 0x59 });
-	// lea rax, [rax + orig_ep_rva]
-	// 48 8D 80 xx xx xx xx
-	emit({ 0x48, 0x8D, 0x80 }); emit32(orig_ep_rva);
-	// jmp rax
-	// FF E0
-	emit({ 0xFF, 0xE0 });
+
+	if (tls_chain_rva != 0) {
+		// Tail-call to original first TLS callback via jmp rel32.
+		// disp32 = tls_chain_rva - (stub_rva + jmp_end_offset_in_stub)
+		// jmp_end_offset_in_stub = current code.size() + 5  (E9 + imm32 = 5 bytes)
+		uint32_t jmp_end_offset = (uint32_t)code.size() + 5;
+		int32_t disp = (int32_t)tls_chain_rva - (int32_t)(stub_rva + jmp_end_offset);
+		emit({ 0xE9 }); emit32((uint32_t)disp);
+	} else {
+		// Entry-point mode: lea rax, [rax + orig_ep_rva]; jmp rax
+		// (rax was popped above and still holds ImageBase from this stack frame)
+		// Note: in this path rax is the popped value, which is ImageBase.
+		emit({ 0x48, 0x8D, 0x80 }); emit32(orig_ep_rva);
+		emit({ 0xFF, 0xE0 });
+	}
 
 	return code;
 }

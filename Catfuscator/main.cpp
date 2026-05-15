@@ -35,6 +35,9 @@ int main(int args, char* argv[]) {
 	bool disable_add = false;
 	bool disable_lea = false;
 	bool disable_antidisasm = false;
+	bool disable_junk = false;
+	bool disable_deadcode = false;
+	bool disable_ff_obf = false;
 
 	for (int i = 2; i < args; i++) {
 		std::string arg = argv[i];
@@ -66,6 +69,15 @@ int main(int args, char* argv[]) {
 		}
 		else if (arg == "--no-antidisasm") {
 			disable_antidisasm = true;
+		}
+		else if (arg == "--no-junk") {
+			disable_junk = true;
+		}
+		else if (arg == "--no-deadcode") {
+			disable_deadcode = true;
+		}
+		else if (arg == "--no-ff-obf") {
+			disable_ff_obf = true;
 		}
 	}
 
@@ -105,14 +117,23 @@ int main(int args, char* argv[]) {
 			uint32_t stub_offset = pe.align(table_offset + table_size, 16);
 			uint32_t stub_rva = new_section->VirtualAddress + stub_offset;
 			uint32_t orig_ep = pe.get_nt()->OptionalHeader.AddressOfEntryPoint;
+
+			// TLS hijack: if the image has TLS callbacks, install ourselves as
+			// the first one so we run BEFORE __dyn_tls_init (which reads
+			// .rdata strings in C++ static initialisers).
+			uint32_t tls_chain_rva = pe.hijack_first_tls_callback(stub_rva);
 			auto stub = pe64::generate_string_decrypt_stub(
-				table_rva, (uint32_t)strings.size(), orig_ep, stub_rva);
+				table_rva, (uint32_t)strings.size(), orig_ep, stub_rva, tls_chain_rva);
 			memcpy(section_base + stub_offset, stub.data(), stub.size());
-			pe.get_nt()->OptionalHeader.AddressOfEntryPoint = stub_rva;
+			if (tls_chain_rva == 0) {
+				// No TLS callbacks - patch the entry point as usual.
+				pe.get_nt()->OptionalHeader.AddressOfEntryPoint = stub_rva;
+			}
+			// else: our stub runs from the TLS callback slot, original EP stays.
 
 			uint32_t added = stub_offset + (uint32_t)stub.size();
-			printf("[string-encrypt] encrypted %zu strings, stub at RVA 0x%X\n",
-				strings.size(), stub_rva);
+			printf("[string-encrypt] encrypted %zu strings, stub at RVA 0x%X (tls_chain=0x%X)\n",
+				strings.size(), stub_rva, tls_chain_rva);
 
 			auto extension = std::filesystem::path(binary_path).extension();
 			pe.save_to_disk(
@@ -147,6 +168,10 @@ int main(int args, char* argv[]) {
 				functions.insert(functions.end(), marker_funcs.begin(), marker_funcs.end());
 			}
 		}
+		// Push diagnostic flags into the obfuscator's static gates
+		obfuscator::disable_junk = disable_junk;
+		obfuscator::disable_deadcode = disable_deadcode;
+		obfuscator::disable_ff_obf = disable_ff_obf;
 
 		// PDB-based function discovery
 		if (use_pdb) {
@@ -210,16 +235,22 @@ int main(int args, char* argv[]) {
 				uint32_t stub_offset_pre = table_offset + table_size;
 				uint32_t stub_rva = new_section->VirtualAddress + stub_offset_pre;
 				uint32_t orig_ep = pe.get_nt()->OptionalHeader.AddressOfEntryPoint;
+
+				// TLS hijack (see hijack_first_tls_callback comment in pe.cpp).
+				uint32_t tls_chain_rva = pe.hijack_first_tls_callback(stub_rva);
 				auto stub = pe64::generate_string_decrypt_stub(
-					table_rva, (uint32_t)strings.size(), orig_ep, stub_rva);
+					table_rva, (uint32_t)strings.size(), orig_ep, stub_rva, tls_chain_rva);
 
 				// Write stub after table
 				uint32_t stub_offset = stub_offset_pre;
 				memcpy(section_base + stub_offset, stub.data(), stub.size());
 
-				// Patch entry point to our stub
-				pe.get_nt()->OptionalHeader.AddressOfEntryPoint =
-					new_section->VirtualAddress + stub_offset;
+				if (tls_chain_rva == 0) {
+					// Patch entry point to our stub only when there are no TLS
+					// callbacks to hijack.
+					pe.get_nt()->OptionalHeader.AddressOfEntryPoint =
+						new_section->VirtualAddress + stub_offset;
+				}
 
 				// Update added size
 				added = stub_offset + (uint32_t)stub.size();

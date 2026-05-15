@@ -57,5 +57,15 @@ public:
 	// Returns stub bytes; table_rva, stub_rva and orig_ep_rva are embedded.
 	static std::vector<uint8_t> generate_string_decrypt_stub(
 		uint32_t table_rva, uint32_t entry_count, uint32_t orig_ep_rva,
-		uint32_t stub_rva);
+		uint32_t stub_rva, uint32_t tls_chain_rva = 0);
+
+	// If the image has TLS callbacks, hijack the first one to point to stub_rva
+	// and return the original first-callback RVA so the stub knows whom to
+	// chain to. Returns 0 if no TLS directory / no callbacks.
+	//
+	// TLS callbacks run BEFORE the entry point. Without this hijack, the MSVC
+	// __dyn_tls_init runs first and may read .rdata strings that are still
+	// encrypted (because our entry-point stub hasn't run yet), producing
+	// garbled output in static C++ initialisers (lots of these in hotspot/JVM).
+	uint32_t hijack_first_tls_callback(uint32_t stub_rva);
 };
