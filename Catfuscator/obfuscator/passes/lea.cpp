@@ -3,7 +3,7 @@
 #include <random>
 
 using namespace asmjit;
-bool obfuscator::obfuscsate_lea(std::vector<obfuscator::function_t>::iterator& function, std::vector<obfuscator::instruction_t>::iterator& instruction) {
+bool obfuscator::obfuscate_lea(std::vector<obfuscator::function_t>::iterator& function, std::vector<obfuscator::instruction_t>::iterator& instruction) {
 
 
 	auto x86_register_map = lookupmap.find(instruction->zyinstr.operands[0].reg.value);

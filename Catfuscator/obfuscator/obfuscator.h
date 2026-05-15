@@ -5,6 +5,7 @@
 
 #include <bit>
 #include <map>
+#include <random>
 #include <string>
 #include <algorithm>
 #include <unordered_map>
@@ -85,13 +86,21 @@ private:
 		These are our actual obfuscation passes
 	*/
 
-	bool obfuscsate_lea(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+	bool obfuscate_lea(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool obfuscate_ff(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool add_junk(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool add_dead_code(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool add_dead_code_after_last(std::vector<obfuscator::function_t>::iterator& func_iter, int after_index);
 	bool obfuscate_mov(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
 	bool obfuscate_add(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+	bool obfuscate_sub(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+	bool obfuscate_xor(std::vector<obfuscator::function_t>::iterator& func_iter, std::vector<obfuscator::instruction_t>::iterator& instruction_iter);
+
+	// Anti-emulation primitives — implementation in passes/antiemu.cpp.
+	instruction_t make_inline_antiemu(int func_id, bool allow_syscall = false);
+	void embed_antiemu_noise(std::vector<instruction_t>& instrs, int func_id, std::mt19937& gen);
+	bool anti_emu_check(std::vector<function_t>::iterator& function,
+		std::vector<instruction_t>::iterator& instruction);
 public:
 
 	obfuscator(pe64* pe);

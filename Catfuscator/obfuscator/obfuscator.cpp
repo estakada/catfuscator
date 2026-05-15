@@ -347,20 +347,22 @@ void obfuscator::shift_after_widening(function_t* func,
 	for (auto it = widened_inst; it != func->instructions.end(); ++it) {
 		it->relocated_address += delta;
 	}
-	// (b) shift every subsequent function entirely.
-	//     DISABLED FOR DIAGNOSIS — see if reverting helps the JVM case.
-	// bool past_current = false;
-	// for (auto fi = this->functions.begin(); fi != this->functions.end(); ++fi) {
-	// 	if (past_current) {
-	// 		for (auto& inst : fi->instructions) {
-	// 			inst.relocated_address += delta;
-	// 		}
-	// 	} else if (&(*fi) == func) {
-	// 		past_current = true;
-	// 	}
-	// }
-	// (c) account for the growth in the total size.
-	// this->total_size_used += delta;
+	// (b) shift every subsequent function entirely. Without this, function N
+	//     growing by `delta` bytes means function N+1's instructions stay at
+	//     their old relocated_address while N's tail bytes overwrite N+1's
+	//     prologue. The trampoline from .text to N+1 then lands mid-instruction.
+	bool past_current = false;
+	for (auto fi = this->functions.begin(); fi != this->functions.end(); ++fi) {
+		if (past_current) {
+			for (auto& inst : fi->instructions) {
+				inst.relocated_address += delta;
+			}
+		} else if (&(*fi) == func) {
+			past_current = true;
+		}
+	}
+	// (c) account for the growth in total .cat usage.
+	this->total_size_used += delta;
 }
 
 bool obfuscator::fix_relative_jmps(function_t* func) {
@@ -751,11 +753,23 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 					this->obfuscate_add(func, instruction);
 			}
 
+			//Obfuscate SUB (same toggle as ADD — both are MBA arithmetic)
+			if (func->mutateobf) {
+				if (instruction->zyinstr.info.mnemonic == ZYDIS_MNEMONIC_SUB)
+					this->obfuscate_sub(func, instruction);
+			}
+
+			//Obfuscate XOR (reg-reg). Has internal next_reads_flags check.
+			if (func->mutateobf) {
+				if (instruction->zyinstr.info.mnemonic == ZYDIS_MNEMONIC_XOR)
+					this->obfuscate_xor(func, instruction);
+			}
+
 
 			//Obfuscate LEA
 			if (func->leaobf) {
 				if (instruction->zyinstr.info.mnemonic == ZYDIS_MNEMONIC_LEA && instruction->has_relative)
-					this->obfuscsate_lea(func, instruction);
+					this->obfuscate_lea(func, instruction);
 			}
 
 

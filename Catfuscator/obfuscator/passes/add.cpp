@@ -2,6 +2,43 @@
 
 #include <random>
 
+// True if the next instruction consumes EFLAGS bits ADD would have set. Each
+// of the four ADD-mutation patterns clobbers flags (not/sub/neg/etc.). If we
+// rewrite ADD into one of those without knowing the downstream uses flags,
+// we silently change semantics of e.g. ADC, CMOV, Jcc, SETcc.
+static bool add_next_reads_flags(std::vector<obfuscator::instruction_t>::iterator instruction,
+	std::vector<obfuscator::instruction_t>::iterator end) {
+	auto next = instruction + 1;
+	if (next == end) return true;
+	auto m = next->zyinstr.info.mnemonic;
+	switch (m) {
+	case ZYDIS_MNEMONIC_JNBE: case ZYDIS_MNEMONIC_JB: case ZYDIS_MNEMONIC_JBE:
+	case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_JNB:
+	case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_JNLE: case ZYDIS_MNEMONIC_JNO:
+	case ZYDIS_MNEMONIC_JNP: case ZYDIS_MNEMONIC_JNS: case ZYDIS_MNEMONIC_JNZ:
+	case ZYDIS_MNEMONIC_JO: case ZYDIS_MNEMONIC_JP: case ZYDIS_MNEMONIC_JS:
+	case ZYDIS_MNEMONIC_JZ:
+	case ZYDIS_MNEMONIC_CMOVB: case ZYDIS_MNEMONIC_CMOVBE: case ZYDIS_MNEMONIC_CMOVL:
+	case ZYDIS_MNEMONIC_CMOVLE: case ZYDIS_MNEMONIC_CMOVNB: case ZYDIS_MNEMONIC_CMOVNBE:
+	case ZYDIS_MNEMONIC_CMOVNL: case ZYDIS_MNEMONIC_CMOVNLE: case ZYDIS_MNEMONIC_CMOVNO:
+	case ZYDIS_MNEMONIC_CMOVNP: case ZYDIS_MNEMONIC_CMOVNS: case ZYDIS_MNEMONIC_CMOVNZ:
+	case ZYDIS_MNEMONIC_CMOVO: case ZYDIS_MNEMONIC_CMOVP: case ZYDIS_MNEMONIC_CMOVS:
+	case ZYDIS_MNEMONIC_CMOVZ:
+	case ZYDIS_MNEMONIC_SETB: case ZYDIS_MNEMONIC_SETBE: case ZYDIS_MNEMONIC_SETL:
+	case ZYDIS_MNEMONIC_SETLE: case ZYDIS_MNEMONIC_SETNB: case ZYDIS_MNEMONIC_SETNBE:
+	case ZYDIS_MNEMONIC_SETNL: case ZYDIS_MNEMONIC_SETNLE: case ZYDIS_MNEMONIC_SETNO:
+	case ZYDIS_MNEMONIC_SETNP: case ZYDIS_MNEMONIC_SETNS: case ZYDIS_MNEMONIC_SETNZ:
+	case ZYDIS_MNEMONIC_SETO: case ZYDIS_MNEMONIC_SETP: case ZYDIS_MNEMONIC_SETS:
+	case ZYDIS_MNEMONIC_SETZ:
+	case ZYDIS_MNEMONIC_ADC: case ZYDIS_MNEMONIC_SBB:
+	case ZYDIS_MNEMONIC_RCL: case ZYDIS_MNEMONIC_RCR:
+	case ZYDIS_MNEMONIC_PUSHF: case ZYDIS_MNEMONIC_PUSHFQ:
+		return true;
+	default:
+		return false;
+	}
+}
+
 bool obfuscator::obfuscate_add(std::vector<obfuscator::function_t>::iterator& function, std::vector<obfuscator::instruction_t>::iterator& instruction) {
 
 	if (instruction->zyinstr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER && instruction->zyinstr.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -19,6 +56,13 @@ bool obfuscator::obfuscate_add(std::vector<obfuscator::function_t>::iterator& fu
 			return true;
 
 		if (first.size() != second.size())
+			return true;
+
+		// Skip mutation when the next instruction reads flags. ADD sets OF/SF/
+		// ZF/AF/CF/PF; all four mutation patterns set them differently (not/
+		// sub/neg/add+sub chains), so any flag-dependent successor would
+		// silently see the wrong condition.
+		if (add_next_reads_flags(instruction, function->instructions.end()))
 			return true;
 
 		std::random_device rd;

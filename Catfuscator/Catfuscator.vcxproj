@@ -152,9 +152,12 @@
     <ClCompile Include="obfuscator\obfuscator.cpp" />
     <ClCompile Include="obfuscator\passes\add.cpp" />
     <ClCompile Include="obfuscator\passes\antidisassembly.cpp" />
+    <ClCompile Include="obfuscator\passes\antiemu.cpp" />
     <ClCompile Include="obfuscator\passes\deadcode.cpp" />
     <ClCompile Include="obfuscator\passes\lea.cpp" />
     <ClCompile Include="obfuscator\passes\mov.cpp" />
+    <ClCompile Include="obfuscator\passes\sub.cpp" />
+    <ClCompile Include="obfuscator\passes\xor.cpp" />
     <ClCompile Include="markers\marker_scanner.cpp" />
     <ClCompile Include="vm\vm_translator.cpp" />
     <ClCompile Include="vm\vm_dispatcher.cpp" />
