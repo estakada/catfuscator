@@ -1197,6 +1197,14 @@ void vm_dispatcher::emit_push_handler(x86::Assembler& a, handler_labels& labels)
 	emit_poly_index_to_offset(a, rcx);
 	a.mov(rax, qword_ptr(rbx, rcx));
 	a.push(rax);
+	// Mirror real-RSP movement into the stored VRSP slot so that subsequent
+	// VRSP-relative semantics stay consistent (e.g. user code reading the
+	// stored VRSP via VM_MOV_REG_REG). Without this, the stored VRSP value
+	// is the entry-time value forever and any VRSP arithmetic in user code
+	// goes stale on first push. The PRIOR design assumed VRSP was decorative
+	// and only the physical stack mattered, but real binaries that mix push
+	// with VRSP-based arithmetic broke immediately.
+	a.sub(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSP)), Imm(8));
 	emit_chain_dispatch(a, labels);
 }
 
@@ -1208,6 +1216,8 @@ void vm_dispatcher::emit_pop_handler(x86::Assembler& a, handler_labels& labels) 
 	emit_poly_index_to_offset(a, rcx);
 	a.pop(rax);
 	a.mov(qword_ptr(rbx, rcx), rax);
+	// See VM_PUSH_REG: mirror the real-RSP +=8 into stored VRSP.
+	a.add(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSP)), Imm(8));
 	emit_chain_dispatch(a, labels);
 }
 
