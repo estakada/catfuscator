@@ -678,7 +678,19 @@ void vm_dispatcher::emit_mov_reg_imm64_handler(x86::Assembler& a, handler_labels
 	emit_poly_advance_ip(a, 8);
 	// vm_regs[vreg] = imm64
 	emit_poly_index_to_offset(a, rcx);
+	a.mov(r9, qword_ptr(rbx, rcx));    // r9 = old value (for VRSP delta)
 	a.mov(qword_ptr(rbx, rcx), rax);
+
+	// VRSP write-through: see emit_mov_reg_reg_handler.
+	{
+		Label skip_rsp = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp);
+		a.sub(rsp, r9);
+		a.add(rsp, rax);
+		a.bind(skip_rsp);
+	}
+
 	emit_chain_dispatch(a, labels);
 }
 
@@ -691,8 +703,25 @@ void vm_dispatcher::emit_mov_reg_reg_handler(x86::Assembler& a, handler_labels& 
 	emit_poly_advance_ip(a, 2);
 	emit_poly_index_to_offset(a, rcx);
 	emit_poly_index_to_offset(a, rdx);
-	a.mov(rax, qword_ptr(rbx, rdx));
+	a.mov(rax, qword_ptr(rbx, rdx));   // rax = src value (= new dst value)
+	// Read OLD dst value before overwrite, so we can compute the delta and
+	// apply it to real rsp if dst happens to be VRSP. For non-VRSP dst this
+	// extra load is one branch + skip.
+	a.mov(r9, qword_ptr(rbx, rcx));    // r9 = old dst value
 	a.mov(qword_ptr(rbx, rcx), rax);
+
+	// VRSP write-through: real_rsp += (new - old) when destination is the
+	// VRSP slot. Handles `mov rsp, reg` patterns (rare in optimised code
+	// but appears in setjmp/longjmp paths and hand-written assembly).
+	{
+		Label skip_rsp = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp);
+		a.sub(rsp, r9);
+		a.add(rsp, rax);
+		a.bind(skip_rsp);
+	}
+
 	emit_chain_dispatch(a, labels);
 }
 
