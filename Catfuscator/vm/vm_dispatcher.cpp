@@ -1321,26 +1321,27 @@ void vm_dispatcher::emit_call_native_handler(x86::Assembler& a, handler_labels& 
 	a.xor_(rax, r12);
 	emit_poly_advance_ip(a, 8);
 
-	// Save VM state (RSI, RBX are callee-saved or we save them)
-	a.push(rsi);
-	a.push(rbx);
-
-	// Set up native registers from VM context for the call (Windows x64 ABI)
+	// Set up native ABI registers from vm_context.
 	a.mov(rcx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRCX)));
 	a.mov(rdx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDX)));
-	a.mov(r8, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR8)));
-	a.mov(r9, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR9)));
+	a.mov(r8,  qword_ptr(rbx, table.perm_gp_off(vm_reg::VR8)));
+	a.mov(r9,  qword_ptr(rbx, table.perm_gp_off(vm_reg::VR9)));
 
-	// Shadow space (32 bytes)
-	a.sub(rsp, 32);
+	// PRIOR DESIGN: pushed rsi+rbx onto the stack and did its own
+	// `sub rsp, 32` for shadow space. That broke stack args 5+ because
+	// real_rsp at `call` time was 48 bytes BELOW the user-expected rsp,
+	// so the callee read garbage at [rsp+32..+56] instead of args 5-8.
+	//
+	// With the VRSP write-through fixes (push/pop, add/sub, mov, lea all
+	// mirror into real rsp), real_rsp at this point already equals what
+	// the user-emitted x64-ABI-compliant call site expects:
+	//   - shadow space already allocated by user's `sub rsp, 32`
+	//   - args 5+ already placed at user's [rsp+32..]
+	// So we just trust the ABI: rsi, rbx, r12-r15 are callee-preserved
+	// (Windows x64), and we don't touch the stack ourselves.
 	a.call(rax);
-	a.add(rsp, 32);
 
-	// Restore VM state
-	a.pop(rbx);
-	a.pop(rsi);
-
-	// Save return value
+	// Save return value into VRAX.
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), rax);
 
 	a.jmp(labels.dispatch_loop);
@@ -1368,20 +1369,13 @@ void vm_dispatcher::emit_call_native_reloc_handler(x86::Assembler& a, handler_la
 	a.add(rax, r14);
 	emit_poly_advance_ip(a, 8);
 
-	a.push(rsi);
-	a.push(rbx);
-
+	// See emit_call_native_handler: trust ABI, don't push/pad ourselves.
 	a.mov(rcx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRCX)));
 	a.mov(rdx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDX)));
-	a.mov(r8, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR8)));
-	a.mov(r9, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR9)));
+	a.mov(r8,  qword_ptr(rbx, table.perm_gp_off(vm_reg::VR8)));
+	a.mov(r9,  qword_ptr(rbx, table.perm_gp_off(vm_reg::VR9)));
 
-	a.sub(rsp, 32);
 	a.call(rax);
-	a.add(rsp, 32);
-
-	a.pop(rbx);
-	a.pop(rsi);
 
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), rax);
 
