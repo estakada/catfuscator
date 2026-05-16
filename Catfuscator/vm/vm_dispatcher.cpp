@@ -710,12 +710,24 @@ void vm_dispatcher::emit_mov_reg_mem_handler(x86::Assembler& a, handler_labels& 
 	a.cmp(dl, 0xFF);
 	Label has_base = a.newLabel();
 	Label addr_ready = a.newLabel();
+	Label not_vrsp_base = a.newLabel();
+	Label do_add_disp = a.newLabel();
 	a.jne(has_base);
 	a.mov(rax, r8);                    // no base, addr = disp only
 	a.jmp(addr_ready);
 	a.bind(has_base);
+	// User wrote [rsp+N]: translator emitted the permuted VRSP index here.
+	// We MUST use the real hardware RSP (where physical pushes actually wrote
+	// data), not the stored VRSP slot (which mirrors the user-visible rsp
+	// value but doesn't reflect the dispatcher's local frame offset).
+	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
+	a.jne(not_vrsp_base);
+	a.mov(rax, rsp);
+	a.jmp(do_add_disp);
+	a.bind(not_vrsp_base);
 	a.shl(rdx, 3);
 	a.mov(rax, qword_ptr(rbx, rdx));  // base value
+	a.bind(do_add_disp);
 	a.add(rax, r8);                    // + disp
 	a.bind(addr_ready);
 
@@ -757,13 +769,21 @@ void vm_dispatcher::emit_mov_mem_reg_handler(x86::Assembler& a, handler_labels& 
 
 	// Compute dest address
 	Label has_base = a.newLabel(), addr_ready = a.newLabel();
+	Label mr_not_vrsp = a.newLabel(), mr_do_add_disp = a.newLabel();
 	a.cmp(cl, 0xFF);
 	a.jne(has_base);
 	a.mov(rdi, rdx);
 	a.jmp(addr_ready);
 	a.bind(has_base);
+	// VRSP base -> use real RSP (see emit_mov_reg_mem_handler for rationale)
+	a.cmp(cl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
+	a.jne(mr_not_vrsp);
+	a.mov(rdi, rsp);
+	a.jmp(mr_do_add_disp);
+	a.bind(mr_not_vrsp);
 	a.shl(rcx, 3);
 	a.mov(rdi, qword_ptr(rbx, rcx));
+	a.bind(mr_do_add_disp);
 	a.add(rdi, rdx);
 	a.bind(addr_ready);
 
@@ -1840,10 +1860,17 @@ void vm_dispatcher::emit_mov_reg_sib_handler(x86::Assembler& a, handler_labels& 
 	// Compute address: base_val + index_val * scale + disp
 	a.xor_(rax, rax);
 	Label has_base = a.newLabel(), base_done = a.newLabel();
+	Label sib_not_vrsp = a.newLabel();
 	a.cmp(dl, 0xFF);
 	a.jne(has_base);
 	a.jmp(base_done);
 	a.bind(has_base);
+	// VRSP base -> real RSP (see emit_mov_reg_mem_handler rationale)
+	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
+	a.jne(sib_not_vrsp);
+	a.mov(rax, rsp);
+	a.jmp(base_done);
+	a.bind(sib_not_vrsp);
 	a.push(rdx);
 	a.shl(rdx, 3);
 	a.mov(rax, qword_ptr(rbx, rdx));
@@ -1889,10 +1916,17 @@ void vm_dispatcher::emit_mov_sib_reg_handler(x86::Assembler& a, handler_labels& 
 	// Compute dest address
 	a.xor_(rdi, rdi);
 	Label has_base = a.newLabel(), base_done = a.newLabel();
+	Label sib2_not_vrsp = a.newLabel();
 	a.cmp(cl, 0xFF);
 	a.jne(has_base);
 	a.jmp(base_done);
 	a.bind(has_base);
+	// VRSP base -> real RSP
+	a.cmp(cl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
+	a.jne(sib2_not_vrsp);
+	a.mov(rdi, rsp);
+	a.jmp(base_done);
+	a.bind(sib2_not_vrsp);
 	a.push(rcx);
 	a.shl(rcx, 3);
 	a.mov(rdi, qword_ptr(rbx, rcx));
