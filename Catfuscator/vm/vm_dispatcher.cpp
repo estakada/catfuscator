@@ -182,8 +182,23 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 
 	if (jt_table_offset > 0 && jt_table_offset + TABLE_SIZE <= code_size) {
 			for (int i = 0; i < TABLE_ENTRIES; i++) {
-				uint32_t delta = resolved_offsets[i] - (jt_table_offset + i * 8);
+				// Runtime does `rcx = jt_table_addr + delta; jmp rcx;` so delta
+				// must be `handler_offset - jt_table_offset` (the +i*8 the
+				// original code subtracted would only be correct if the runtime
+				// had loaded `[jt_table + rax*8] + (jt_table + rax*8)` — but it
+				// adds rdx (= jt_table_addr) only, not the entry's own address).
+				int32_t delta = static_cast<int32_t>(resolved_offsets[i]) -
+				                static_cast<int32_t>(jt_table_offset);
 				uint8_t* entry = code_buf + jt_table_offset + i * 8;
+				// PRIOR BUG: `delta` was computed but never written before the XOR,
+				// so the table ended up as (0xCC ^ keystream) — random garbage —
+				// and any virtualised region that actually called the dispatcher
+				// jumped to a wild address and hung/crashed. Write the delta as
+				// a signed int32 (matches runtime's `movsxd rcx, [rdx+rax*8]`),
+				// zero the high 32 bits, THEN XOR with keystream so the runtime
+				// RC4 PRGA recovers the delta.
+				*reinterpret_cast<int32_t*>(entry) = delta;
+				*reinterpret_cast<int32_t*>(entry + 4) = 0;
 				for (int b = 0; b < 8; b++) {
 					entry[b] ^= keystream[i * 8 + b];
 				}
@@ -336,24 +351,39 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 		Label pra_loop = a.newLabel();
 		Label dec_done = a.newLabel();
 
-		// RSI still points to encrypted bytecode (set by caller)
-		// Allocate S-box (256 bytes) on stack, aligned
+		// Save the bytecode-start pointer + RBX (register file ptr) + RBP.
+		// PRIOR BUG: the KSA + PRGA below clobbered EBX/EBP (= rbx/rbp), and
+		// the loop incremented R12 past the bytecode end before doing
+		// `mov rsi, r12` — so on exit RSI pointed PAST bytecode_end and the
+		// dispatch loop read garbage opcodes from beyond the buffer.
+		a.push(rbx);
+		a.push(rbp);
+		a.push(rsi); // save bytecode start
+
+		// RSI still points to encrypted bytecode (set by caller).
+		// Allocate S-box (256 bytes) + worst-case 256-byte alignment slack.
+		// 256 bytes useful + 255 bytes slack = 511, round up to 512.
+		a.sub(rsp, 512);
 		a.mov(rdi, rsp);
-		a.sub(rdi, 256);
-		a.and_(rdi, ~0xFF);
+		a.add(rdi, 255);
+		a.and_(rdi, ~0xFF); // align UP to 256 — rdi now in [rsp, rsp+255], S-box ends at rdi+255 ≤ rsp+510 < rsp+512
 
 		// --- KSA: init S[i] = i ---
+		// PRIOR BUG: walked ecx 255→0 while incrementing al 0→255, so the
+		// final S-box was REVERSED identity (S[255]=0, S[254]=1, ..., S[0]=255)
+		// instead of the C++ rc4_crypt's S[i]=i. Combined with the swap bug
+		// below this fully scrambled the keystream against the encrypter.
+		// Fix: just write CL into S[rcx] so S[i]=i regardless of walk order.
 		{
 			Label init_loop = a.newLabel();
 			a.mov(ecx, 256);
-			a.mov(eax, 0);
 			a.bind(init_loop);
 			a.dec(ecx);
-			a.mov(byte_ptr(rdi, rcx), al);
-			a.inc(al);
+			a.mov(byte_ptr(rdi, rcx), cl);
 			a.test(ecx, ecx);
 			a.jnz(init_loop);
 		}
+
 
 		// --- Key lookup: embed key as immediate table ---
 		// IMPORTANT: jump OVER the key data; otherwise after the KSA init loop
@@ -363,29 +393,49 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 		Label skip_key = a.newLabel();
 		a.jmp(skip_key);
 		a.bind(key_label);
-		for (int ki = 0; ki < key_size; ki++)
-			a.db(key[ki]);
+		// PRIOR BUG: KSA reads key_label[0..255], but only `key_size` bytes
+		// were embedded — the rest were the *following instructions* read
+		// as key bytes. C++ rc4_crypt wraps via `key[i % key_size]`, so the
+		// JIT's S-box never matched the encrypter's and decryption produced
+		// garbage. Fix: pre-cycle the key to a full 256 bytes so the JIT
+		// can index linearly without a modulo.
+		for (int ki = 0; ki < 256; ki++)
+			a.db(key[ki % key_size]);
 		a.bind(skip_key);
 
 		// --- KSA: scramble with key (256 iterations) ---
+		// PRIOR BUG: the swap stored `bl` (the i counter) into S[j] instead
+		// of the OLD value of S[i]. That works only while S is still the
+		// identity permutation (S[i] == i == bl), so iteration 0 is correct
+		// but every subsequent iteration where a previous swap touched S[i]
+		// produces the wrong S-box. The runtime keystream therefore never
+		// matched the C++ encrypter's keystream, and decryption produced
+		// random bytecode. Fix: keep S[i] in EAX through the j-compute and
+		// do a real S[i] <-> S[j] swap.
 		{
 			a.mov(ebx, 0); // i = 0
 			a.mov(ebp, 0); // j = 0
 			Label ksa_outer = a.newLabel();
 			a.bind(ksa_outer);
-			a.movzx(eax, byte_ptr(rdi, rbx)); // S[i]
-			a.add(ebp, eax);
+			a.movzx(eax, byte_ptr(rdi, rbx)); // eax = S[i]
+			a.add(ebp, eax);                  // j += S[i]
 			a.and_(ebp, 0xFF);
-			a.movzx(edx, byte_ptr(key_label, rbx)); // key[i]
-			a.add(ebp, edx);
+			a.movzx(edx, byte_ptr(key_label, rbx)); // edx = key[i]
+			a.add(ebp, edx);                  // j += key[i]
 			a.and_(ebp, 0xFF);
-			// swap S[i], S[j]
-			a.movzx(eax, byte_ptr(rdi, rbp));
-			a.mov(byte_ptr(rdi, rbp), bl);
-			a.mov(byte_ptr(rdi, rbx), al);
+			// swap S[i], S[j]  (eax still holds old S[i])
+			a.movzx(edx, byte_ptr(rdi, rbp)); // edx = S[j]
+			a.mov(byte_ptr(rdi, rbp), al);    // S[j] = old S[i]
+			a.mov(byte_ptr(rdi, rbx), dl);    // S[i] = old S[j]
+			// PRIOR BUG: `inc bl; cmp bl, 255; jbe loop` is an infinite loop
+			// because when bl wraps 255→0, `0 <= 255 (unsigned)` is true and
+			// jbe is taken — the KSA never terminates. Replace with
+			// `inc bl; jnz loop` so the wrap-to-zero exits after exactly 256
+			// iterations. This is THE hang root cause: every region whose
+			// dispatcher actually got called spun forever inside VM_ENTER's
+			// KSA.
 			a.inc(bl);
-			a.cmp(bl, 255);
-			a.jbe(ksa_outer);
+			a.jnz(ksa_outer);
 		}
 		a.bind(ksa_end);
 
@@ -423,10 +473,14 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 		a.jmp(pra_loop);
 		a.bind(dec_done);
 
-		// Restore RSI
-		a.mov(rsi, r12);
-		// Clean S-box
-		a.add(rsp, 256);
+		// Clean S-box (matches the `sub rsp, 512` above).
+		a.add(rsp, 512);
+		// Restore RSI to bytecode_start (was pushed before alloc),
+		// then RBP / RBX (in reverse order).
+		a.pop(rsi);
+		a.pop(rbp);
+		a.pop(rbx);
+
 	}
 
 	// R12 = XOR key for encrypted immediates
@@ -614,27 +668,70 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 
 	// O(1) jump table dispatch
 	// Decrypt table entries in-place with RC4 (same key as bytecode)
+	//
+	// PRIOR BUG (3 issues compounded — every region that actually called the
+	// dispatcher hung):
+	//   1. `mov r12, qword_ptr(jt_key)` loaded the FIRST 8 KEY BYTES as a value
+	//      and treated them as a target address. Result: the XOR-decrypt loop
+	//      wrote into wild memory while the jt_table itself stayed encrypted.
+	//      Fix: `lea r12, [jt_table]`.
+	//   2. The KSA clobbered EBX (= VM register file pointer) and EBP without
+	//      ever restoring them, so handlers after the first dispatch saw
+	//      rbx=0 and crashed/hung. Fix: push/pop rbx,rbp around the block.
+	//   3. The whole RC4 PRGA ran on every dispatch loop iteration. Because
+	//      XOR-decrypt is a toggle, odd iterations left the table plaintext
+	//      and even iterations re-encrypted it — so any region with >= 2 VM
+	//      ops jumped to garbage on the 2nd op. Fix: guard byte, run once.
+	//   4. `add rsp, 256` after the KSA without a matching `sub rsp, 256`
+	//      shifted RSP into the middle of the VM register file. Fix:
+	//      allocate properly with `sub rsp, 256` first.
 	{
-		// IMPORTANT: jump OVER the embedded key bytes. Without this, control
-		// flow from the self-modifying-bytecode section above falls through
-		// into the raw key data and the CPU executes the key as instructions.
-		// (Outer- and inner-mode VM_ENTER above already do this correctly via
-		// their own jmp/skip_key labels. This was the third site that needed
-		// the same guard.)
 		Label jt_key = a.newLabel();
 		Label jt_skip_key = a.newLabel();
+		Label guard_byte = a.newLabel();
+		Label skip_decrypt = a.newLabel();
+
+		// Check guard byte: if non-zero, table already decrypted, skip.
+		a.cmp(byte_ptr(guard_byte), 0);
+		a.jne(skip_decrypt);
+		// Set guard so subsequent dispatches skip the decrypt.
+		a.mov(byte_ptr(guard_byte), Imm(1));
+
+		// Preserve every register the KSA+PRGA touches that the VM needs:
+		// RAX = decoded opcode (about to be used by the dispatch jump table)
+		// RBX = VM register file pointer
+		// RBP = saved frame
+		// RSI = VM IP (bytecode pointer)
+		// RDI = S-box scratch
+		// R12 = imm_xor_key (used by encrypted-immediate handlers)
+		a.push(rax);
+		a.push(rbx);
+		a.push(rbp);
+		a.push(rsi);
+		a.push(rdi);
+		a.push(r12);
+
 		a.jmp(jt_skip_key);
 		a.bind(jt_key);
-		for (int ki = 0; ki < key_size; ki++) a.db(key[ki]);
+		// Same key-wrap fix as VM_ENTER: pre-cycle to 256 bytes so the KSA
+		// can linearly index without a modulo.
+		for (int ki = 0; ki < 256; ki++) a.db(key[ki % key_size]);
+		a.bind(guard_byte);
+		a.db(0); // 1-byte guard, initially 0 (decrypt pending)
 		a.bind(jt_skip_key);
-		Label ksa_end = a.newLabel();
-		a.bind(ksa_end);
+
+		// Properly allocate 256 + worst-case 255-byte alignment slack = 512.
+		a.sub(rsp, 512);
 		a.mov(rdi, rsp);
-		a.sub(rdi, 256);
-		a.and_(rdi, ~0xFF);
-		{ Label init = a.newLabel(); a.mov(ecx, 256); a.mov(eax, 0); a.bind(init); a.dec(ecx); a.mov(byte_ptr(rdi, rcx), al); a.inc(al); a.test(ecx, ecx); a.jnz(init); }
-		{ a.mov(ebx, 0); a.mov(ebp, 0); Label klp = a.newLabel(); a.bind(klp); a.movzx(eax, byte_ptr(rdi, rbx)); a.add(ebp, eax); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(jt_key, rbx)); a.add(ebp, edx); a.and_(ebp, 0xFF); a.movzx(eax, byte_ptr(rdi, rbp)); a.mov(byte_ptr(rdi, rbp), bl); a.mov(byte_ptr(rdi, rbx), al); a.inc(bl); a.cmp(bl, 255); a.jbe(klp); }
-		a.mov(r12, qword_ptr(jt_key));
+		a.add(rdi, 255);
+		a.and_(rdi, ~0xFF); // align UP — S-box fits within [rsp, rsp+512).
+
+		// KSA init: same fix as VM_ENTER — write CL so S[i]=i, not reversed.
+		{ Label init = a.newLabel(); a.mov(ecx, 256); a.bind(init); a.dec(ecx); a.mov(byte_ptr(rdi, rcx), cl); a.test(ecx, ecx); a.jnz(init); }
+		// KSA (same correctness fix as VM_ENTER's KSA — real swap, not `S[j]=bl`,
+		// and inc/jnz exit so the 8-bit counter actually terminates).
+		{ a.mov(ebx, 0); a.mov(ebp, 0); Label klp = a.newLabel(); a.bind(klp); a.movzx(eax, byte_ptr(rdi, rbx)); a.add(ebp, eax); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(jt_key, rbx)); a.add(ebp, edx); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(rdi, rbp)); a.mov(byte_ptr(rdi, rbp), al); a.mov(byte_ptr(rdi, rbx), dl); a.inc(bl); a.jnz(klp); }
+		a.lea(r12, qword_ptr(jt_table)); // FIX: actually target the jt_table
 		a.xor_(ebx, ebx); a.xor_(esi, esi);
 		a.mov(ecx, TABLE_SIZE);
 		Label plp = a.newLabel(); a.bind(plp);
@@ -653,7 +750,18 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 		a.mov(rdx, r12); a.add(rdx, TABLE_SIZE); a.sub(rdx, rcx);
 		a.xor_(byte_ptr(rdx), al);
 		a.dec(ecx); a.jmp(plp); a.bind(pdone);
-		a.add(rsp, 256);
+
+		// Restore RSP from the proper allocation, then restore preserved regs
+		// (reverse order of push).
+		a.add(rsp, 512);
+		a.pop(r12);
+		a.pop(rdi);
+		a.pop(rsi);
+		a.pop(rbp);
+		a.pop(rbx);
+		a.pop(rax);
+
+		a.bind(skip_decrypt);
 	}
 
 	// O(1) jump table dispatch
@@ -3744,7 +3852,10 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 	// Build-time: checksum = XOR of all encrypted bytecode bytes (simple, no key needed).
 	// Runtime: recompute same XOR, compare with embedded expected value.
 	{
-		Label cs_ok = a.newLabel();
+		Label size_ok = a.newLabel();   // post-size-check landing
+		Label cs_done = a.newLabel();   // post-checksum-loop landing
+		Label cs_match = a.newLabel();  // checksum equal -> proceed to register-restore
+		Label cs_kill  = a.newLabel();  // checksum mismatch -> std::exit
 
 		// r13 = bytecode start (set in enter handler)
 		// rsi = bytecode end (current VM IP at exit)
@@ -3753,34 +3864,46 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 
 		// Check size matches
 		a.cmp(eax, bytecode_size_for_checksum);
-		a.je(cs_ok);
+		a.je(size_ok);
 		// Size mismatch: bytecode was modified
 		a.movabs(rax, Imm(reinterpret_cast<uint64_t>(std::exit)));
 		a.xor_(ecx, ecx);
 		a.call(rax);
-		a.bind(cs_ok);
+		a.bind(size_ok);
 
-		// Compute XOR of all bytecode bytes
+		// Compute XOR of all bytecode bytes.
+		// PRIOR BUG: cs_loop's "out-of-data" exit jumped back to cs_ok which
+		// was bound BEFORE the loop, producing an infinite loop. The hang
+		// manifested only on VIRTUALIZE regions whose checksum-loop body
+		// executed at all (most workloads survived because the loop iterated
+		// once and then re-entered the unchanged cs_ok block, but the body
+		// happened to re-trip the jae condition each time -- classic
+		// label-aliasing trap). Use distinct cs_done label for loop exit.
 		a.xor_(edx, edx); // checksum accumulator
 		a.mov(r8, r13);   // src = bytecode start
 		a.mov(r9, rsi);   // end = current IP
 		Label cs_loop = a.newLabel();
 		a.bind(cs_loop);
 		a.cmp(r8, r9);
-		a.jae(cs_ok);
+		a.jae(cs_done);
 		a.xor_(dl, byte_ptr(r8));
 		a.inc(r8);
 		a.jmp(cs_loop);
+		a.bind(cs_done);
 
 		// Compare with expected
 		a.cmp(edx, bytecode_checksum);
-		a.je(labels.exit_label);
+		a.je(cs_match);
 
 		// Checksum mismatch: kill process
+		a.bind(cs_kill);
 		a.movabs(rax, Imm(reinterpret_cast<uint64_t>(std::exit)));
 		a.xor_(ecx, ecx);
 		a.call(rax);
 		a.ud2();
+
+		// Match: fall through to register-restore
+		a.bind(cs_match);
 	}
 
 	// Restore GP registers from VM context
