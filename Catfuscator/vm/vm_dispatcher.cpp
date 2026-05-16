@@ -920,6 +920,24 @@ void vm_dispatcher::emit_alu_reg_reg_handler(x86::Assembler& a, handler_labels& 
 	a.mov(qword_ptr(rbx, VRFLAGS_OFF), r9);
 
 	a.mov(qword_ptr(rbx, rcx), rax);
+
+	// VRSP write-through: when the user did `add rsp, reg` / `sub rsp, reg`
+	// (stack-frame allocation or restore), we must also adjust the real
+	// hardware RSP by the same delta. The companion SIB-base==VRSP fix
+	// routes [rsp+N] reads through real rsp, so without this mirror the
+	// dispatcher's stack and the user's stack diverge by K bytes on every
+	// frame allocation.
+	if (op == vm_op::VM_ADD_REG_REG || op == vm_op::VM_SUB_REG_REG) {
+		Label skip_rsp_sync = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp_sync);
+		if (op == vm_op::VM_ADD_REG_REG)
+			a.add(rsp, r8);
+		else
+			a.sub(rsp, r8);
+		a.bind(skip_rsp_sync);
+	}
+
 	a.jmp(labels.dispatch_loop);
 }
 
@@ -1023,6 +1041,20 @@ void vm_dispatcher::emit_alu_reg_imm_handler(x86::Assembler& a, handler_labels& 
 	a.mov(qword_ptr(rbx, VRFLAGS_OFF), r9);
 
 	a.mov(qword_ptr(rbx, rcx), rax);
+
+	// VRSP write-through for `add rsp, K` / `sub rsp, K` (stack-frame
+	// allocation). See the same block in emit_alu_reg_reg_handler.
+	if (op == vm_op::VM_ADD_REG_IMM || op == vm_op::VM_SUB_REG_IMM) {
+		Label skip_rsp_sync = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp_sync);
+		if (op == vm_op::VM_ADD_REG_IMM)
+			a.add(rsp, r8);
+		else
+			a.sub(rsp, r8);
+		a.bind(skip_rsp_sync);
+	}
+
 	a.jmp(labels.dispatch_loop);
 }
 
