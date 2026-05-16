@@ -609,9 +609,18 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 	// O(1) jump table dispatch
 	// Decrypt table entries in-place with RC4 (same key as bytecode)
 	{
+		// IMPORTANT: jump OVER the embedded key bytes. Without this, control
+		// flow from the self-modifying-bytecode section above falls through
+		// into the raw key data and the CPU executes the key as instructions.
+		// (Outer- and inner-mode VM_ENTER above already do this correctly via
+		// their own jmp/skip_key labels. This was the third site that needed
+		// the same guard.)
 		Label jt_key = a.newLabel();
+		Label jt_skip_key = a.newLabel();
+		a.jmp(jt_skip_key);
 		a.bind(jt_key);
 		for (int ki = 0; ki < key_size; ki++) a.db(key[ki]);
+		a.bind(jt_skip_key);
 		Label ksa_end = a.newLabel();
 		a.bind(ksa_end);
 		a.mov(rdi, rsp);
