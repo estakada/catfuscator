@@ -116,11 +116,17 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	}
 
 	// --- Anti-tamper: compute XOR-checksum of encrypted bytecode ---
-	{
+	// nested_mode passes bytecode_data == nullptr (the inner bytecode lives
+	// alongside the inner dispatcher and is not assembled into the outer
+	// PE buffer at this point). Skip the checksum in that case; the outer
+	// dispatcher is the only one that uses bytecode_checksum.
+	if (bytecode_data) {
 		uint32_t cs = 0;
 		for (size_t i = 0; i < bytecode_size; i++)
 			cs ^= bytecode_data[i];
 		this->bytecode_checksum = cs;
+	} else {
+		this->bytecode_checksum = 0;
 	}
 
 	// --- Jump table dispatch: post-process handler offsets (skip for indirect mode) ---
