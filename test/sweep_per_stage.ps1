@@ -20,19 +20,19 @@ if (-not (Test-Path $exe)) {
 # Per-stage stats
 $stats   = @{}
 $saved   = @{}    # stage -> @{ pass=$path; fail=$path } (first occurrences)
-for ($s = 1; $s -le 8; $s++) {
+for ($s = 1; $s -le 12; $s++) {
     $stats[$s] = @{ Pass = 0; Fail = 0; Crash = 0; ExpectMismatch = 0 }
     $saved[$s] = @{ Pass = $null; Fail = $null }
 }
 
-Write-Output "Sweeping $Seeds seeds across stages 1..8..."
+Write-Output "Sweeping $Seeds seeds across stages 1..12..."
 
 for ($seed = 1; $seed -le $Seeds; $seed++) {
     & $catfuscator $exe --markers 2>&1 | Out-Null
     if (-not (Test-Path $obfExe)) { continue }
     $obfHash = (Get-FileHash $obfExe).Hash.Substring(0, 12)
 
-    for ($stage = 1; $stage -le 8; $stage++) {
+    for ($stage = 1; $stage -le 12; $stage++) {
         $proc = Start-Process -FilePath $obfExe -ArgumentList "$stage" -PassThru -NoNewWindow -Wait `
                               -RedirectStandardOutput "out.tmp" -RedirectStandardError "err.tmp"
         $ec = $proc.ExitCode
@@ -72,7 +72,7 @@ for ($seed = 1; $seed -le $Seeds; $seed++) {
 
 Write-Output ""
 Write-Output "=== Per-stage results ==="
-for ($s = 1; $s -le 8; $s++) {
+for ($s = 1; $s -le 12; $s++) {
     $st = $stats[$s]
     $total = $st.Pass + $st.Fail + $st.ExpectMismatch
     $rate  = if ($total -gt 0) { ($st.Pass / $total) * 100 } else { 0 }
@@ -81,7 +81,7 @@ for ($s = 1; $s -le 8; $s++) {
 
 Write-Output ""
 Write-Output "=== Saved diagnostic pairs ==="
-for ($s = 1; $s -le 8; $s++) {
+for ($s = 1; $s -le 12; $s++) {
     if ($saved[$s].Pass)  { Write-Output ("stage{0} PASS sample: {1}" -f $s, $saved[$s].Pass) }
     if ($saved[$s].Fail)  { Write-Output ("stage{0} FAIL sample: {1}" -f $s, $saved[$s].Fail) }
 }
