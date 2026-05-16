@@ -782,7 +782,18 @@ void vm_dispatcher::emit_mov_reg_mem_handler(x86::Assembler& a, handler_labels& 
 	a.bind(done);
 
 	a.shl(rcx, 3);
+	// VRSP write-through for `mov rsp, [mem]` (longjmp-style rsp restore).
+	// Read old VRSP into r9 before overwriting, adjust real rsp by delta.
+	a.mov(r9, qword_ptr(rbx, rcx));
 	a.mov(qword_ptr(rbx, rcx), rax);
+	{
+		Label skip_rsp = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp);
+		a.sub(rsp, r9);
+		a.add(rsp, rax);
+		a.bind(skip_rsp);
+	}
 	a.jmp(labels.dispatch_loop);
 }
 
@@ -1604,18 +1615,36 @@ void vm_dispatcher::emit_lea_handler(x86::Assembler& a, handler_labels& labels) 
 	emit_poly_advance_ip(a, 6);
 
 	Label has_base = a.newLabel(), done = a.newLabel();
+	Label lea_base_not_vrsp = a.newLabel();
 	a.cmp(dl, 0xFF);
 	a.jne(has_base);
-	a.mov(rax, r8);
+	a.mov(rax, r8);                                        // no base: addr = disp only
 	a.jmp(done);
 	a.bind(has_base);
+	// LEA base==VRSP -> real rsp (same as memory loads)
+	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
+	a.jne(lea_base_not_vrsp);
+	a.mov(rax, rsp);
+	a.add(rax, r8);                                        // + disp
+	a.jmp(done);
+	a.bind(lea_base_not_vrsp);
 	emit_poly_index_to_offset(a, rdx);
 	a.mov(rax, qword_ptr(rbx, rdx));
-	a.add(rax, r8);
+	a.add(rax, r8);                                        // + disp
 	a.bind(done);
 
 	emit_poly_index_to_offset(a, rcx);
+	// VRSP write-through for `lea rsp, [...]`.
+	a.mov(r9, qword_ptr(rbx, rcx));
 	a.mov(qword_ptr(rbx, rcx), rax);
+	{
+		Label skip_rsp = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp);
+		a.sub(rsp, r9);
+		a.add(rsp, rax);
+		a.bind(skip_rsp);
+	}
 	a.jmp(labels.dispatch_loop);
 }
 
@@ -1959,7 +1988,17 @@ void vm_dispatcher::emit_mov_reg_sib_handler(x86::Assembler& a, handler_labels& 
 	a.bind(done);
 
 	a.shl(rcx, 3);
+	// VRSP write-through for `mov rsp, [base + idx*s + disp]`.
+	a.mov(r9, qword_ptr(rbx, rcx));
 	a.mov(qword_ptr(rbx, rcx), rax);
+	{
+		Label skip_rsp = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp);
+		a.sub(rsp, r9);
+		a.add(rsp, rax);
+		a.bind(skip_rsp);
+	}
 	a.jmp(labels.dispatch_loop);
 }
 
@@ -2033,10 +2072,17 @@ void vm_dispatcher::emit_lea_sib_handler(x86::Assembler& a, handler_labels& labe
 	// Compute: base_val + index_val * scale + disp
 	a.xor_(rax, rax);
 	Label has_base = a.newLabel(), base_done = a.newLabel();
+	Label lea_sib_not_vrsp = a.newLabel();
 	a.cmp(dl, 0xFF);
 	a.jne(has_base);
 	a.jmp(base_done);
 	a.bind(has_base);
+	// LEA SIB base==VRSP -> real rsp
+	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
+	a.jne(lea_sib_not_vrsp);
+	a.mov(rax, rsp);
+	a.jmp(base_done);
+	a.bind(lea_sib_not_vrsp);
 	a.shl(rdx, 3);
 	a.mov(rax, qword_ptr(rbx, rdx));
 	a.bind(base_done);
@@ -2048,7 +2094,17 @@ void vm_dispatcher::emit_lea_sib_handler(x86::Assembler& a, handler_labels& labe
 	a.add(rax, r10);
 
 	a.shl(rcx, 3);
+	// VRSP write-through for `lea rsp, [base + idx*s + disp]`.
+	a.mov(r9, qword_ptr(rbx, rcx));
 	a.mov(qword_ptr(rbx, rcx), rax);
+	{
+		Label skip_rsp = a.newLabel();
+		a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+		a.jne(skip_rsp);
+		a.sub(rsp, r9);
+		a.add(rsp, rax);
+		a.bind(skip_rsp);
+	}
 	a.jmp(labels.dispatch_loop);
 }
 
