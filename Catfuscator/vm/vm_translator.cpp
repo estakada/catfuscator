@@ -870,7 +870,23 @@ bool vm_translator::translate_mov(const obfuscator::instruction_t& inst, std::ve
 	if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER && operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
 		uint8_t vreg, sz;
 		if (!map_register(operands[0].reg.value, vreg, sz)) return false;
-		emit_mov_reg_imm64(bc, vreg, operands[1].imm.value.s);
+		// CRITICAL: x64 `mov r32, imm32` ZERO-extends the result into the
+		// full 64-bit register (writing any 32-bit register clears the high
+		// 32 bits). `mov r64, imm32` sign-extends (the C7 /0 form), and
+		// `mov r64, imm64` is the only true 64-bit move. Zydis hands us
+		// `.imm.value.s` already sign-extended to int64_t -- which is what
+		// the 64-bit forms want, but FOR THE 32-BIT FORM it produces the
+		// wrong upper bits whenever the immediate has bit 31 set. Stage 10
+		// (`mov eax, 0xA1B2C3D4`, bit 31 set) was hitting exactly this:
+		// VM put 0xFFFFFFFFA1B2C3D4 into VRAX instead of 0xA1B2C3D4, then
+		// the subsequent xor rbx, rax propagated the bogus upper half into
+		// locals[0] and cascaded through every downstream local.
+		int64_t imm = operands[1].imm.value.s;
+		if (sz == 4) {
+			// dest is a 32-bit register name -> zero-extend the immediate
+			imm = static_cast<int64_t>(static_cast<uint32_t>(imm));
+		}
+		emit_mov_reg_imm64(bc, vreg, imm);
 		return true;
 	}
 

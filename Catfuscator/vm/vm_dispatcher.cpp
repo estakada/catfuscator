@@ -29,7 +29,7 @@ static constexpr int CTX_SAVE_RFLAGS_OFF  = VM_REG_FILE_ALLOC + 48;
 static constexpr int CTX_SAVE_RSI_OFF     = VM_REG_FILE_ALLOC + 56;
 static constexpr int CTX_SAVE_RDI_OFF     = VM_REG_FILE_ALLOC + 64;
 static constexpr int CTX_SAVE_RETADDR_OFF = VM_REG_FILE_ALLOC + 72;
-static constexpr int CTX_BUFFER_SIZE      = VM_REG_FILE_ALLOC + 80; // 480 bytes total
+static constexpr int CTX_BUFFER_SIZE      = VM_REG_FILE_ALLOC + 80; // 480 bytes
 
 vm_dispatcher::vm_dispatcher(const vm_opcode_table& table) : table(table), dispatcher_size(0), mba(opaque_rng), nested_mode(false), inner_dispatcher_rva(0) {}
 
@@ -47,9 +47,28 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	this->nested_mode = nested_mode;
 	this->dispatch_key = key;
 	this->dispatch_key_size = key_size;
-	this->bytecode_checksum = 0;
 	this->bytecode_data = bytecode_data;
 	this->bytecode_size_for_checksum = bytecode_size;
+	// CRITICAL: compute checksum NOW, before emit_exit_handler is called.
+	// emit_exit_handler captures `bytecode_checksum` as an asmjit Imm at
+	// emit time -- if we wait until after generate()'s tail to set it, the
+	// JIT'd `cmp edx, bytecode_checksum` is encoded against the stale zero
+	// initial value. At runtime the loop XOR'd byte stream is virtually
+	// never zero, so the equality test fails and the dispatcher invokes
+	// std::exit (whose address was baked in from the OBFUSCATOR process,
+	// not the obfuscated target) -- crashing every VIRTUALIZEd region
+	// that actually reached VM_EXIT. nested_mode dispatchers pass
+	// bytecode_data == nullptr and don't run the checksum, so they were
+	// fine. Stages 9/10 hit this with 100% reliability once their handler
+	// bugs were fixed.
+	if (bytecode_data) {
+		uint32_t cs = 0;
+		for (size_t i = 0; i < bytecode_size; i++)
+			cs ^= bytecode_data[i];
+		this->bytecode_checksum = cs;
+	} else {
+		this->bytecode_checksum = 0;
+	}
 
 	// Seed opaque predicate RNG from opcode table + per-region key
 	uint32_t op_seed = table.mapping[0] ^ (table.mapping[1] << 16) ^ static_cast<uint32_t>(imm_xor_key);
@@ -130,19 +149,8 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 		emit_exit_handler(a, labels);
 	}
 
-	// --- Anti-tamper: compute XOR-checksum of encrypted bytecode ---
-	// nested_mode passes bytecode_data == nullptr (the inner bytecode lives
-	// alongside the inner dispatcher and is not assembled into the outer
-	// PE buffer at this point). Skip the checksum in that case; the outer
-	// dispatcher is the only one that uses bytecode_checksum.
-	if (bytecode_data) {
-		uint32_t cs = 0;
-		for (size_t i = 0; i < bytecode_size; i++)
-			cs ^= bytecode_data[i];
-		this->bytecode_checksum = cs;
-	} else {
-		this->bytecode_checksum = 0;
-	}
+	// bytecode_checksum was computed at the top of generate(), before any
+	// handlers were emitted -- see the long comment there.
 
 	// --- Jump table dispatch: post-process handler offsets (skip for indirect mode) ---
 	if (!settings || !settings->indirect_dispatch) {
@@ -3970,24 +3978,34 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 	// transfers control back to the caller.
 	a.push(qword_ptr(rbx, CTX_SAVE_RETADDR_OFF));
 
-	// Restore the dispatcher-clobbered callee-saved regs from the save area.
-	a.mov(rbp, qword_ptr(rbx, CTX_SAVE_RBP_OFF));
-	a.mov(r12, qword_ptr(rbx, CTX_SAVE_R12_OFF));
-	a.mov(r13, qword_ptr(rbx, CTX_SAVE_R13_OFF));
-	a.mov(r14, qword_ptr(rbx, CTX_SAVE_R14_OFF));
-	a.mov(r15, qword_ptr(rbx, CTX_SAVE_R15_OFF));
-	a.mov(rsi, qword_ptr(rbx, CTX_SAVE_RSI_OFF));
-	a.mov(rdi, qword_ptr(rbx, CTX_SAVE_RDI_OFF));
+	// Restore callee-saved regs from the VM REG FILE slots (NOT the save
+	// area). The virtualized region runs as if it were inline native code:
+	// any modification it made to rbp/r12-r15/rsi/rdi must be visible to the
+	// native code that resumes after VM_EXIT, otherwise the user_function's
+	// own register allocation breaks (it CHOSE to use those regs as scratch
+	// because its prologue saved them, then expects the virt region to leave
+	// the new values in them). The save area is only used for the return
+	// address now — the regs themselves get propagated through the vreg
+	// slots which are kept up-to-date by every handler.
+	a.mov(rbp, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRBP)));
+	a.mov(r12, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR12)));
+	a.mov(r13, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR13)));
+	a.mov(r14, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR14)));
+	a.mov(r15, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR15)));
+	a.mov(rsi, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSI)));
+	a.mov(rdi, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDI)));
 
-	// Restore RFLAGS (use the saved-area slot, not the vreg slot — VRFLAGS
-	// could have been mutated by user code, but the caller expects its
-	// own original flags back).
-	a.push(qword_ptr(rbx, CTX_SAVE_RFLAGS_OFF));
+	// Restore RFLAGS from the VRFLAGS slot (mutated by user code) so any
+	// arith-flag dependency that crosses the VIRTUALIZE_END boundary keeps
+	// working. (Was previously CTX_SAVE_RFLAGS — that gave back the
+	// caller's pre-virt flags and silently dropped a cmp/test issued inside
+	// the virt region.)
+	a.push(qword_ptr(rbx, VRFLAGS_OFF));
 	a.popfq();
 
-	// Restore RBX last (it was our ctx pointer; once we overwrite it we
-	// can't touch the buffer again).
-	a.mov(rbx, qword_ptr(rbx, CTX_SAVE_RBX_OFF));
+	// Restore RBX last from the VRBX vreg slot (it was our ctx pointer
+	// throughout dispatch). Same rationale as the other callee-saved regs.
+	a.mov(rbx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRBX)));
 
 	a.ret();
 }

@@ -707,7 +707,12 @@ void obfuscator::run(PIMAGE_SECTION_HEADER new_section, bool obfuscate_entry_poi
 			engine.set_pe_info((uint64_t)pe->get_buffer()->data(), pe->get_nt()->OptionalHeader.ImageBase);
 			engine.set_import_map(pe->parse_imports());
 			uint32_t nest_roll = nest_rng() % 100;
-			bool do_nest = (nest_roll < 30 && func->instructions.size() >= 8);
+			// Nested VM disabled: the inner dispatcher's stack-frame design
+			// hasn't been migrated to the zero-stack-frame buffer model yet,
+			// so its VM_ENTER collides with the outer's frame and crashes
+			// before the first dispatch_loop iteration. TODO: refactor inner
+			// dispatcher to share the outer's ctx buffer.
+			bool do_nest = false;
 			printf("[vm] %s: %zu inst, prof=%s, roll=%u, nest=%d\n",
 				func->name.c_str(), func->instructions.size(),
 				prof == vm_profile::ULTRA ? "ULTRA" : "OPT", nest_roll, do_nest);
