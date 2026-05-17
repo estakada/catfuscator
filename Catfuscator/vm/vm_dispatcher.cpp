@@ -16,15 +16,20 @@ using namespace asmjit::x86;
 
 static constexpr int VRFLAGS_OFF = vm_gp_offset(static_cast<int>(vm_reg::VRFLAGS));
 static constexpr int VM_REG_FILE_ALLOC = (VM_REG_FILE_TOTAL + 15) & ~15; // 400 -> 400 (already aligned)
-// Distance from runtime RSP (inside dispatch loop) up to the user's logical
-// RSP at entry to the virtualized region. 9 callee-saved pushes (8 GPRs +
-// pushfq) = 72 bytes, plus VM_REG_FILE_ALLOC = 400, plus 8 bytes for the
-// dispatcher's own return-address slot. So real_rsp + 480 == user's
-// "rsp at virtualize_begin" right after VM_ENTER. All VRSP-base memory
-// accesses must use this offset; using real RSP directly puts writes 480
-// bytes too low (into our saved-regs area or below) and corrupts the VM
-// frame on the very first `mov [rsp+K], reg` the user emits.
-static constexpr int VM_FRAME_OFFSET = VM_REG_FILE_ALLOC + 72 + 8;
+// Save-area offsets inside the vm_ctx_buffer (start at 400, past the
+// register file). These hold the CALLER's callee-saved registers + return
+// address so the dispatcher doesn't need any stack frame of its own.
+static constexpr int CTX_SAVE_RBX_OFF     = VM_REG_FILE_ALLOC + 0;
+static constexpr int CTX_SAVE_RBP_OFF     = VM_REG_FILE_ALLOC + 8;
+static constexpr int CTX_SAVE_R12_OFF     = VM_REG_FILE_ALLOC + 16;
+static constexpr int CTX_SAVE_R13_OFF     = VM_REG_FILE_ALLOC + 24;
+static constexpr int CTX_SAVE_R14_OFF     = VM_REG_FILE_ALLOC + 32;
+static constexpr int CTX_SAVE_R15_OFF     = VM_REG_FILE_ALLOC + 40;
+static constexpr int CTX_SAVE_RFLAGS_OFF  = VM_REG_FILE_ALLOC + 48;
+static constexpr int CTX_SAVE_RSI_OFF     = VM_REG_FILE_ALLOC + 56;
+static constexpr int CTX_SAVE_RDI_OFF     = VM_REG_FILE_ALLOC + 64;
+static constexpr int CTX_SAVE_RETADDR_OFF = VM_REG_FILE_ALLOC + 72;
+static constexpr int CTX_BUFFER_SIZE      = VM_REG_FILE_ALLOC + 80; // 480 bytes total
 
 vm_dispatcher::vm_dispatcher(const vm_opcode_table& table) : table(table), dispatcher_size(0), mba(opaque_rng), nested_mode(false), inner_dispatcher_rva(0) {}
 
@@ -62,6 +67,7 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 	labels.dispatch_continue = a.newLabel();
 	labels.exit_label = a.newLabel();
 	labels.jt_table_label = a.newLabel();
+	labels.vm_ctx_buffer = a.newLabel();
 	for (int i = 0; i < static_cast<int>(vm_op::VM_COUNT); i++)
 		labels.handlers[i] = a.newLabel();
 	for (int d = 0; d < vm_opcode_table::TOTAL_DUPS; d++)
@@ -289,64 +295,63 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 		return;
 	}
 
-	// --- Outer VM entry (original) ---
+	// --- Outer VM entry (NEW: zero-stack-frame design) ---
+	// Save the CALLER's state into the static per-dispatcher ctx buffer
+	// rather than onto the stack. After this prologue completes:
+	//   - rbx points at the ctx buffer (containing VM reg file + save area)
+	//   - real rsp == user's logical rsp at VIRTUALIZE_BEGIN (no offset)
+	//   - the dispatcher contributes ZERO bytes of stack frame, so user code
+	//     inside the virt region sees [rsp+disp] / push / pop landing on
+	//     its own stack frame, not on our saved-regs scratch.
+	//
+	// Entry state: [rsp] = return address, rcx = bytecode pointer.
 
-	// Save callee-saved registers we'll clobber
-	a.push(rbx);
-	a.push(rbp);
-	a.push(r12);
-	a.push(r13);
-	a.push(r14);
-	a.push(r15);
+	// Step 1: stash caller's rbx into the buffer (we're about to clobber rbx).
+	// We can't yet address the buffer through rbx, so do the dance through
+	// the stack: push caller_rbx, load rbx with ctx ptr, then pop to slot.
+	a.push(rbx);                                                  // rsp -= 8
+	a.lea(rbx, qword_ptr(labels.vm_ctx_buffer));                  // rbx = &ctx
+	a.pop(qword_ptr(rbx, CTX_SAVE_RBX_OFF));                      // ctx.rbx = caller_rbx; rsp += 8
+
+	// Step 2: pop the return address into the buffer. After this rsp ==
+	// the user's logical rsp at the call site of the dispatcher (which IS
+	// the user's logical rsp at VIRTUALIZE_BEGIN, since the stub's CALL is
+	// the only thing between).
+	a.pop(qword_ptr(rbx, CTX_SAVE_RETADDR_OFF));                  // rsp += 8
+
+	// Step 3: save the remaining callee-saved regs into the buffer.
+	a.mov(qword_ptr(rbx, CTX_SAVE_RBP_OFF), rbp);
+	a.mov(qword_ptr(rbx, CTX_SAVE_R12_OFF), r12);
+	a.mov(qword_ptr(rbx, CTX_SAVE_R13_OFF), r13);
+	a.mov(qword_ptr(rbx, CTX_SAVE_R14_OFF), r14);
+	a.mov(qword_ptr(rbx, CTX_SAVE_R15_OFF), r15);
+	a.mov(qword_ptr(rbx, CTX_SAVE_RSI_OFF), rsi);
+	a.mov(qword_ptr(rbx, CTX_SAVE_RDI_OFF), rdi);
 	a.pushfq();
+	a.pop(qword_ptr(rbx, CTX_SAVE_RFLAGS_OFF));
 
-	// RSI = bytecode pointer, already set by caller before jumping here
-	// But we need to save RSI too since we use it as VM IP
-	a.push(rsi);
-	a.push(rdi);
-
-	// Allocate VM register file on stack: GP (17*8=136) + XMM (16*16=256) = 392 -> 400 aligned
-	a.sub(rsp, VM_REG_FILE_ALLOC);
-	a.mov(rbx, rsp); // RBX = base of VM register file
-
-	constexpr int S = VM_REG_FILE_ALLOC;
-
-	// Initialize GP registers from native registers
+	// Step 4: initialize the VM register file from the caller's regs.
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)), rax);
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRCX)), rcx);
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDX)), rdx);
-
-	a.mov(rax, qword_ptr(rsp, S + 64));
+	// VRBX = caller's rbx (read back from save slot)
+	a.mov(rax, qword_ptr(rbx, CTX_SAVE_RBX_OFF));
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRBX)), rax);
-
-	// RSP: original RSP before CALL = rsp + alloc + 9 pushes (72) + return addr (8)
-	a.lea(rax, qword_ptr(rsp, S + 72 + 8));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSP)), rax);
-
-	a.mov(rax, qword_ptr(rsp, S + 56));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRBP)), rax);
-
-	a.mov(rax, qword_ptr(rsp, S + 8));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSI)), rax);
-	a.mov(rax, qword_ptr(rsp, S + 0));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDI)), rax);
-
+	// VRSP = current rsp (= user's logical rsp at virt region start)
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSP)), rsp);
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRBP)), rbp);
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRSI)), rsi);
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDI)), rdi);
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR8)), r8);
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR9)), r9);
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR10)), r10);
 	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR11)), r11);
-
-	a.mov(rax, qword_ptr(rsp, S + 48));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR12)), rax);
-	a.mov(rax, qword_ptr(rsp, S + 40));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR13)), rax);
-	a.mov(rax, qword_ptr(rsp, S + 32));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR14)), rax);
-	a.mov(rax, qword_ptr(rsp, S + 24));
-	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR15)), rax);
-
-	// RFLAGS
-	a.mov(rax, qword_ptr(rsp, S + 16));
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR12)), r12);
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR13)), r13);
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR14)), r14);
+	a.mov(qword_ptr(rbx, table.perm_gp_off(vm_reg::VR15)), r15);
+	// VRFLAGS (re-read from saved slot)
+	a.mov(rax, qword_ptr(rbx, CTX_SAVE_RFLAGS_OFF));
 	a.mov(qword_ptr(rbx, VRFLAGS_OFF), rax);
 
 	// Save XMM registers to VM context
@@ -794,6 +799,20 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 	// RC4-encrypted table data (XOR'd with same keystream)
 	a.bind(jt_table);
 	for (int i = 0; i < TABLE_ENTRIES; i++) { for (int b = 0; b < 8; b++) a.db(0xCC); }
+
+	// Per-dispatcher VM context buffer (zero-initialized, RW).
+	// VM_ENTER stores caller's callee-saved + return address here so the
+	// dispatcher needs ZERO stack frame of its own. Inside dispatch loop,
+	// real rsp == user's logical rsp, so push/pop and [rsp+disp] all work
+	// transparently against the user's own stack frame.
+	// NOTE: this buffer is NOT thread-safe -- the same virtualized region
+	// called concurrently from two threads will race on these slots. Fine
+	// for single-threaded targets; multi-threaded targets must stay on
+	// MUTATE for now (or this gets upgraded to a TLS-backed buffer).
+	if (!nested_mode) {
+		a.bind(labels.vm_ctx_buffer);
+		for (int i = 0; i < CTX_BUFFER_SIZE; i++) a.db(0);
+	}
 }
 void vm_dispatcher::emit_nop_handler(x86::Assembler& a, handler_labels& labels) {
 	a.bind(labels.handlers[static_cast<int>(vm_op::VM_NOP)]);
@@ -883,7 +902,7 @@ void vm_dispatcher::emit_mov_reg_mem_handler(x86::Assembler& a, handler_labels& 
 	// user's logical view of their own stack. See VM_FRAME_OFFSET comment.
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(not_vrsp_base);
-	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
+	a.mov(rax, rsp);
 	a.jmp(do_add_disp);
 	a.bind(not_vrsp_base);
 	a.shl(rdx, 3);
@@ -953,7 +972,7 @@ void vm_dispatcher::emit_mov_mem_reg_handler(x86::Assembler& a, handler_labels& 
 	// own register file / saved regs.
 	a.cmp(cl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(mr_not_vrsp);
-	a.lea(rdi, qword_ptr(rsp, VM_FRAME_OFFSET));
+	a.mov(rdi, rsp);
 	a.jmp(mr_do_add_disp);
 	a.bind(mr_not_vrsp);
 	a.shl(rcx, 3);
@@ -1753,7 +1772,7 @@ void vm_dispatcher::emit_lea_handler(x86::Assembler& a, handler_labels& labels) 
 	// LEA base==VRSP -> real RSP + VM_FRAME_OFFSET (user's logical rsp).
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(lea_base_not_vrsp);
-	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
+	a.mov(rax, rsp);
 	a.add(rax, r8);                                        // + disp
 	a.jmp(done);
 	a.bind(lea_base_not_vrsp);
@@ -2087,7 +2106,7 @@ void vm_dispatcher::emit_mov_reg_sib_handler(x86::Assembler& a, handler_labels& 
 	// VRSP base -> real RSP + VM_FRAME_OFFSET
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(sib_not_vrsp);
-	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
+	a.mov(rax, rsp);
 	a.jmp(base_done);
 	a.bind(sib_not_vrsp);
 	a.push(rdx);
@@ -2153,7 +2172,7 @@ void vm_dispatcher::emit_mov_sib_reg_handler(x86::Assembler& a, handler_labels& 
 	// VRSP base -> real RSP + VM_FRAME_OFFSET
 	a.cmp(cl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(sib2_not_vrsp);
-	a.lea(rdi, qword_ptr(rsp, VM_FRAME_OFFSET));
+	a.mov(rdi, rsp);
 	a.jmp(base_done);
 	a.bind(sib2_not_vrsp);
 	a.push(rcx);
@@ -2209,7 +2228,7 @@ void vm_dispatcher::emit_lea_sib_handler(x86::Assembler& a, handler_labels& labe
 	// LEA SIB base==VRSP -> real RSP + VM_FRAME_OFFSET
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(lea_sib_not_vrsp);
-	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
+	a.mov(rax, rsp);
 	a.jmp(base_done);
 	a.bind(lea_sib_not_vrsp);
 	a.shl(rdx, 3);
@@ -3927,7 +3946,18 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 		a.bind(cs_match);
 	}
 
-	// Restore GP registers from VM context
+	// --- NEW exit: restore from the static ctx buffer (zero-stack-frame). ---
+	// At this point real rsp == user's logical rsp at VIRTUALIZE_END (i.e.
+	// what the user expected after their last instruction). rbx still
+	// points at the ctx buffer.
+
+	// Restore XMM regs first (rbx still valid).
+	for (int i = 0; i < 16; i++) {
+		int off = vm_xmm_offset(static_cast<int>(vm_reg::VXMM0) + i);
+		a.movups(x86::Xmm(i), xmmword_ptr(rbx, off));
+	}
+
+	// Restore GP caller-saved-but-VM-used regs from VM context.
 	a.mov(rax, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRAX)));
 	a.mov(rcx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRCX)));
 	a.mov(rdx, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRDX)));
@@ -3936,23 +3966,28 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 	a.mov(r10, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR10)));
 	a.mov(r11, qword_ptr(rbx, table.perm_gp_off(vm_reg::VR11)));
 
-	// Restore RFLAGS
-	a.push(qword_ptr(rbx, VRFLAGS_OFF));
+	// Push the saved return address onto user's stack so the final RET
+	// transfers control back to the caller.
+	a.push(qword_ptr(rbx, CTX_SAVE_RETADDR_OFF));
+
+	// Restore the dispatcher-clobbered callee-saved regs from the save area.
+	a.mov(rbp, qword_ptr(rbx, CTX_SAVE_RBP_OFF));
+	a.mov(r12, qword_ptr(rbx, CTX_SAVE_R12_OFF));
+	a.mov(r13, qword_ptr(rbx, CTX_SAVE_R13_OFF));
+	a.mov(r14, qword_ptr(rbx, CTX_SAVE_R14_OFF));
+	a.mov(r15, qword_ptr(rbx, CTX_SAVE_R15_OFF));
+	a.mov(rsi, qword_ptr(rbx, CTX_SAVE_RSI_OFF));
+	a.mov(rdi, qword_ptr(rbx, CTX_SAVE_RDI_OFF));
+
+	// Restore RFLAGS (use the saved-area slot, not the vreg slot — VRFLAGS
+	// could have been mutated by user code, but the caller expects its
+	// own original flags back).
+	a.push(qword_ptr(rbx, CTX_SAVE_RFLAGS_OFF));
 	a.popfq();
 
-	// Deallocate VM register file
-	a.add(rsp, VM_REG_FILE_ALLOC);
-
-	// Restore callee-saved registers (reverse order of push)
-	a.pop(rdi);
-	a.pop(rsi);
-	a.add(rsp, 8); // skip pushfq slot
-	a.pop(r15);
-	a.pop(r14);
-	a.pop(r13);
-	a.pop(r12);
-	a.pop(rbp);
-	a.pop(rbx);
+	// Restore RBX last (it was our ctx pointer; once we overwrite it we
+	// can't touch the buffer again).
+	a.mov(rbx, qword_ptr(rbx, CTX_SAVE_RBX_OFF));
 
 	a.ret();
 }
@@ -3962,21 +3997,15 @@ void vm_dispatcher::emit_exit_to_rva_handler(x86::Assembler& a, handler_labels& 
 	emit_handler_entry_junk(a);
 
 	// Format: [opcode] [rva:8] (encrypted with imm_xor_key in R12)
-	// target = (rva ^ R12) + R14, then override the saved return address on stack
-	// so the dispatcher's RET (in exit_label cleanup below) jumps to `target`.
-	//
-	// Stack layout at VM_ENTER time (RBX = RSP after `sub rsp, S`):
-	//   [rbx + S + 72]        : saved return address from CALL [dispatcher]
-	//
-	// We rewrite that slot, then jump to the standard exit cleanup. The RET
-	// at the bottom of the exit handler will pop our new target.
-
+	// target = (rva ^ R12) + R14, then override the saved return address
+	// in the ctx buffer so the dispatcher's RET (in exit_label cleanup) jumps
+	// to `target` instead of back to the dispatcher's caller.
 	a.mov(rax, qword_ptr(rsi));                          // rax = encrypted RVA
 	emit_poly_advance_ip(a, 8);
 	a.xor_(rax, r12);                                    // decrypt with imm_xor_key
 	a.add(rax, r14);                                     // rax = runtime target = rva + image_base
 
-	a.mov(qword_ptr(rbx, VM_REG_FILE_ALLOC + 72), rax);  // overwrite saved RA
+	a.mov(qword_ptr(rbx, CTX_SAVE_RETADDR_OFF), rax);    // overwrite saved RA in ctx
 
 	a.jmp(labels.exit_label);                            // standard cleanup + RET → jumps to `target`
 }

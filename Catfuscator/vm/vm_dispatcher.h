@@ -55,6 +55,15 @@ private:
 		asmjit::Label jt_table_label;
 		// Junk handlers: fake opcode handlers that are never dispatched to
 		std::vector<asmjit::Label> junk_handlers;
+		// Static per-dispatcher VM context buffer (480 bytes).
+		// Layout: [0..400)=VM reg file (permuted vreg slots),
+		//         [400..408)=saved rbx, [408..416)=saved rbp,
+		//         [416..448)=saved r12-r15 (4*8),
+		//         [448..456)=saved rflags, [456..464)=saved rsi,
+		//         [464..472)=saved rdi, [472..480)=saved return address.
+		// Eliminates the dispatcher's stack frame so user code inside the
+		// virtualized region sees an rsp identical to the caller's logical rsp.
+		asmjit::Label vm_ctx_buffer;
 	};
 
 	void emit_enter_handler(asmjit::x86::Assembler& a, handler_labels& labels,
