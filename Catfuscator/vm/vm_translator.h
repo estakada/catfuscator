@@ -110,7 +110,7 @@ private:
 
 	// Opaque constant for i32 immediates in ALU ops (ADD/SUB/XOR/AND/OR/CMP/IMUL)
 	// Replaces raw immediate with XOR+ALU chain: vreg = (val ^ A) then ALU_op vreg, B
-	void emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op);
+	void emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op, uint8_t size);
 
 	// Opaque address: always applies polynomial chain to 64-bit addresses
 	void emit_obfuscated_address(std::vector<uint8_t>& bc, uint8_t vreg, int64_t addr);

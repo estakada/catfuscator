@@ -4742,6 +4742,20 @@ void vm_dispatcher::emit_dup_handler_body(x86::Assembler& a, handler_labels& lab
 		a.pop(r9);
 		a.mov(qword_ptr(rbx, VRFLAGS_OFF), r9);
 		a.mov(qword_ptr(rbx, rcx), rax);
+		// VRSP write-through: original handler mirrors `add/sub rsp, K`
+		// into real rsp; the DUP must do the same or stage 10's `sub rsp, K`
+		// silently desyncs whenever the dispatcher randomly picks the DUP
+		// encoding for the op (via encode_random).
+		{
+			Label skip_rsp = a.newLabel();
+			a.cmp(rcx, Imm(table.perm_gp_off(vm_reg::VRSP)));
+			a.jne(skip_rsp);
+			if (original_op == vm_op::VM_ADD_REG_IMM)
+				a.add(rsp, rdx);
+			else
+				a.sub(rsp, rdx);
+			a.bind(skip_rsp);
+		}
 		emit_chain_dispatch(a, labels);
 		break;
 	}

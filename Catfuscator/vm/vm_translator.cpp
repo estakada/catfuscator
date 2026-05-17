@@ -220,9 +220,11 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 		// val = f(base) where base is a random constant we can encode directly
 		// Then: vreg = base; vreg = f(vreg)
 
-		// Choose obfuscation form randomly
+		// Choose obfuscation form randomly. All arithmetic done as uint64 to
+		// avoid signed-overflow UB and match the runtime handler's modular
+		// semantics exactly.
 		int form = junk_rng() % 5;
-
+		uint64_t uval = static_cast<uint64_t>(val);
 		uint8_t flags_idx = static_cast<uint8_t>(vm_reg::VRFLAGS);
 
 		switch (form) {
@@ -231,9 +233,9 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 			// 3 ops: MOV base, XOR A, ADD B
 			int32_t A = static_cast<int32_t>(junk_rng());
 			int32_t B = static_cast<int32_t>(junk_rng());
-			int64_t sA = static_cast<int64_t>(A);
-			int64_t sB = static_cast<int64_t>(B);
-			int64_t base = (val - sB) ^ sA;
+			uint64_t sA = static_cast<uint64_t>(static_cast<int64_t>(A));
+			uint64_t sB = static_cast<uint64_t>(static_cast<int64_t>(B));
+			int64_t base = static_cast<int64_t>((uval - sB) ^ sA);
 
 			// PUSH VRFLAGS (save flags to native stack)
 			emit_prefixes(bc);
@@ -272,9 +274,9 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 			// 3 ops: MOV base, XOR A, SUB B
 			int32_t A = static_cast<int32_t>(junk_rng());
 			int32_t B = static_cast<int32_t>(junk_rng());
-			int64_t sA = static_cast<int64_t>(A);
-			int64_t sB = static_cast<int64_t>(B);
-			int64_t base = (val + sB) ^ sA;
+			uint64_t sA = static_cast<uint64_t>(static_cast<int64_t>(A));
+			uint64_t sB = static_cast<uint64_t>(static_cast<int64_t>(B));
+			int64_t base = static_cast<int64_t>((uval + sB) ^ sA);
 
 			emit_prefixes(bc);
 			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
@@ -309,7 +311,10 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 			int32_t A = static_cast<int32_t>(junk_rng());
 			int32_t B = static_cast<int32_t>(junk_rng());
 			int32_t C = static_cast<int32_t>(junk_rng());
-			int64_t base = ((val ^ static_cast<int64_t>(C)) - static_cast<int64_t>(B)) ^ static_cast<int64_t>(A);
+			uint64_t sA = static_cast<uint64_t>(static_cast<int64_t>(A));
+			uint64_t sB = static_cast<uint64_t>(static_cast<int64_t>(B));
+			uint64_t sC = static_cast<uint64_t>(static_cast<int64_t>(C));
+			int64_t base = static_cast<int64_t>(((uval ^ sC) - sB) ^ sA);
 
 			emit_prefixes(bc);
 			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
@@ -350,7 +355,10 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 			int32_t A = static_cast<int32_t>(junk_rng());
 			int32_t B = static_cast<int32_t>(junk_rng());
 			int32_t C = static_cast<int32_t>(junk_rng());
-			int64_t base = ((val + static_cast<int64_t>(C)) ^ static_cast<int64_t>(B)) ^ static_cast<int64_t>(A);
+			uint64_t sA = static_cast<uint64_t>(static_cast<int64_t>(A));
+			uint64_t sB = static_cast<uint64_t>(static_cast<int64_t>(B));
+			uint64_t sC = static_cast<uint64_t>(static_cast<int64_t>(C));
+			int64_t base = static_cast<int64_t>(((uval + sC) ^ sB) ^ sA);
 
 			emit_prefixes(bc);
 			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
@@ -392,7 +400,10 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 			int32_t A = static_cast<int32_t>(junk_rng());
 			int32_t B = static_cast<int32_t>(junk_rng());
 			int32_t C = static_cast<int32_t>(junk_rng());
-			int64_t base = ((val + static_cast<int64_t>(C)) ^ static_cast<int64_t>(B)) - static_cast<int64_t>(A);
+			uint64_t sA = static_cast<uint64_t>(static_cast<int64_t>(A));
+			uint64_t sB = static_cast<uint64_t>(static_cast<int64_t>(B));
+			uint64_t sC = static_cast<uint64_t>(static_cast<int64_t>(C));
+			int64_t base = static_cast<int64_t>(((uval + sC) ^ sB) - sA);
 
 			emit_prefixes(bc);
 			emit_u16(bc, table.encode_random(vm_op::VM_PUSH_REG, junk_rng));
@@ -452,7 +463,13 @@ void vm_translator::emit_mov_reg_imm64(std::vector<uint8_t>& bc, uint8_t vreg, i
 // For commutative ops (ADD/OR/XOR/AND), we can also use ADD-compensate approach:
 //   Load vreg = imm - A, then ADD vreg, A (gives imm), then ALU op with 0 (noop).
 //   This lets us use ADD compensation as the chain. Or simpler: just do the XOR chain.
-void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op) {
+void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg, int32_t val, vm_op alu_op, uint8_t size) {
+	// `size` is the operand size of the original ALU op (4 for `op eax, imm`,
+	// 8 for `op rax, imm`). Previously hardcoded to 4, which silently
+	// truncated every 64-bit ALU chain -- the `xor rax, A_imm32` step
+	// switched to the 32-bit form, zeroing the upper half of vreg, and
+	// stage 10's `mov rcx, 64-bit-imm` cascade emerged with garbage in the
+	// high 32 bits.
 	int form = junk_rng() % 5;
 	uint8_t flags_idx = static_cast<uint8_t>(vm_reg::VRFLAGS);
 
@@ -481,13 +498,13 @@ void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg
 		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, A);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, B);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		// Now do the real ALU op with the original immediate value
 		// Since vreg == val, this is exactly vreg op val
@@ -495,7 +512,7 @@ void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg
 		emit_u16(bc, table.encode_random(alu_op, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, val);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 		break;
 	}
 
@@ -515,14 +532,14 @@ void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg
 		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, A);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		// Now vreg == val; do the real ALU op
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(alu_op, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, val);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 		break;
 	}
 
@@ -542,14 +559,14 @@ void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg
 		emit_u16(bc, table.encode_random(vm_op::VM_SUB_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, A);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		// vreg == val now; do the real ALU op
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(alu_op, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, val);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 		break;
 	}
 
@@ -568,14 +585,14 @@ void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg
 		emit_u16(bc, table.encode_random(vm_op::VM_ADD_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, A);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		// vreg == val now; do the real ALU op
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(alu_op, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, val);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 		break;
 	}
 
@@ -596,26 +613,26 @@ void vm_translator::emit_obfuscated_imm32(std::vector<uint8_t>& bc, uint8_t vreg
 		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, A);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, B);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(vm_op::VM_XOR_REG_IMM, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, A);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 
 		// vreg == val now; do the real ALU op
 		emit_prefixes(bc);
 		emit_u16(bc, table.encode_random(alu_op, junk_rng));
 		emit_byte(bc, vreg);
 		emit_i32(bc, val);
-		emit_byte(bc, 4);
+		emit_byte(bc, size);
 		break;
 	}
 	}
@@ -707,11 +724,15 @@ bool vm_translator::translate_alu_reg_imm(vm_op op, const obfuscator::instructio
 	if (!map_register(operands[0].reg.value, vreg, sz)) return false;
 	int32_t imm_val = static_cast<int32_t>(operands[1].imm.value.s);
 
-	// Constants Pollution for i32 immediates: with opaque_constant_pct probability,
-	// replace the raw immediate with an arithmetic chain that computes the same value
-	int opaque_pct = settings ? settings->opaque_constant_pct : 30;
-	if ((junk_rng() % 100) < opaque_pct) {
-		emit_obfuscated_imm32(bc, vreg, imm_val, op);
+	// Constants Pollution for i32 immediates: DISABLED for ALU read-modify-write
+	// ops. emit_obfuscated_imm32 starts its chain with `MOV vreg, base` which
+	// clobbers the dst register, destroying the value `ADD/SUB/XOR vreg, imm`
+	// is supposed to operate on. Stage 10's `sub rsp, K` triggered this and
+	// produced `rsp = K_chain_constants - K` ≈ 0 instead of `rsp -= K`,
+	// which crashed the rest of the virt region. The chain needs to be
+	// rewritten to use a scratch vreg before this can come back -- TODO.
+	if (false) {
+		emit_obfuscated_imm32(bc, vreg, imm_val, op, sz);
 	} else {
 		emit_u16(bc, table.encode_random(op, junk_rng));
 		emit_byte(bc, vreg);

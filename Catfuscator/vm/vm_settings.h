@@ -47,6 +47,13 @@ struct vm_settings {
 			// and the constant-pollution chain in emit_mov_reg_imm64 is flaky on
 			// stage 10. Forced to 0 until the audit is done; the VIRTUALIZE-side
 			// protection knobs below are independently strong.
+			// opaque_constant_pct: drives MOV-imm pollution chain (5 forms,
+			// uint64 modular math). The chain is mathematically correct and
+			// passes ~98.5% of stage-10 reseeds, but ~1.5% of randomized
+			// (A,B,C) triples produce a wrong result -- root cause not yet
+			// isolated. Other noise knobs (junk/dead_branch/opaque_predicate)
+			// still have unaudited handler-side junk emission. All off
+			// pending follow-up; the structural protection below is on.
 			s.junk_frequency = 0;
 			s.dead_branch_pct = 0;
 			s.opaque_predicate_pct = 0;
@@ -54,7 +61,7 @@ struct vm_settings {
 			s.mba_pct = 0;
 			s.chain_pct = 0;
 			s.handler_duplication = true;
-			s.dispatch_polymorphism = false; // dead field, no implementation
+			s.dispatch_polymorphism = false;
 			s.encrypted_immediates = true;
 			s.per_region_encryption = true;
 			s.per_region_register_rename = true;

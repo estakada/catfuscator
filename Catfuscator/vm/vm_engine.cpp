@@ -778,50 +778,10 @@ bool vm_engine::virtualize(const std::vector<obfuscator::instruction_t>& instruc
 	// disagree and the dispatcher calls std::exit -- crashing every region
 	// once per_region_encryption is on.
 	std::vector<uint8_t> bytecode_plain_copy(bytecode);
-	// DBG: dump first 32 bytes
-	printf("[dbg-rc4] PLAIN: ");
-	for (uint32_t i = 0; i < bytecode_size && i < 32; i++) printf("%02X ", bytecode[i]);
-	printf("\n[dbg-rc4] KEY: ");
-	for (int i = 0; i < ENCRYPT_KEY_SIZE; i++) printf("%02X ", encrypt_key[i]);
-	printf("\n");
 
 	if (settings.per_region_encryption)
 		encrypt_bytecode(bytecode);
 
-	if (settings.per_region_encryption) {
-		// Simulate JIT KSA+PRGA in C++ EXACTLY as the asmjit emits it.
-		uint8_t S[256];
-		for (int i = 0; i < 256; i++) S[i] = static_cast<uint8_t>(i);
-		uint8_t kbuf[256];
-		for (int i = 0; i < 256; i++) kbuf[i] = encrypt_key[i % ENCRYPT_KEY_SIZE];
-		uint8_t bl = 0, bp = 0;
-		do {
-			uint8_t Si = S[bl];
-			bp = static_cast<uint8_t>(bp + Si);
-			uint8_t ki = kbuf[bl];
-			bp = static_cast<uint8_t>(bp + ki);
-			uint8_t Sj = S[bp];
-			S[bp] = Si;
-			S[bl] = Sj;
-			bl++;
-		} while (bl != 0);
-		std::vector<uint8_t> jit_dec(bytecode);
-		uint8_t ii = 0, jj = 0;
-		for (size_t k = 0; k < jit_dec.size(); k++) {
-			ii++;
-			uint8_t Sii = S[ii];
-			jj = static_cast<uint8_t>(jj + Sii);
-			uint8_t s_ii_old = S[ii];
-			uint8_t s_jj_old = S[jj];
-			S[ii] = s_jj_old;
-			S[jj] = s_ii_old;
-			uint8_t s_ii_new = S[ii];
-			uint8_t t = static_cast<uint8_t>(s_ii_new + S[jj]);
-			jit_dec[k] ^= S[t];
-		}
-		bool jit_matches = (jit_dec == bytecode_plain_copy);
-		printf("[dbg-rc4] JIT-sim matches plain: %s\n", jit_matches ? "YES" : "NO");
-	}
 
 	std::vector<uint8_t> dispatcher_code;
 	if (!dispatcher.generate(dispatcher_code, encrypt_key, ENCRYPT_KEY_SIZE, bytecode_size,
