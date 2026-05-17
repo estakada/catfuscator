@@ -16,6 +16,15 @@ using namespace asmjit::x86;
 
 static constexpr int VRFLAGS_OFF = vm_gp_offset(static_cast<int>(vm_reg::VRFLAGS));
 static constexpr int VM_REG_FILE_ALLOC = (VM_REG_FILE_TOTAL + 15) & ~15; // 400 -> 400 (already aligned)
+// Distance from runtime RSP (inside dispatch loop) up to the user's logical
+// RSP at entry to the virtualized region. 9 callee-saved pushes (8 GPRs +
+// pushfq) = 72 bytes, plus VM_REG_FILE_ALLOC = 400, plus 8 bytes for the
+// dispatcher's own return-address slot. So real_rsp + 480 == user's
+// "rsp at virtualize_begin" right after VM_ENTER. All VRSP-base memory
+// accesses must use this offset; using real RSP directly puts writes 480
+// bytes too low (into our saved-regs area or below) and corrupts the VM
+// frame on the very first `mov [rsp+K], reg` the user emits.
+static constexpr int VM_FRAME_OFFSET = VM_REG_FILE_ALLOC + 72 + 8;
 
 vm_dispatcher::vm_dispatcher(const vm_opcode_table& table) : table(table), dispatcher_size(0), mba(opaque_rng), nested_mode(false), inner_dispatcher_rva(0) {}
 
@@ -199,8 +208,12 @@ bool vm_dispatcher::generate(std::vector<uint8_t>& dispatcher_code,
 				// RC4 PRGA recovers the delta.
 				*reinterpret_cast<int32_t*>(entry) = delta;
 				*reinterpret_cast<int32_t*>(entry + 4) = 0;
-				for (int b = 0; b < 8; b++) {
-					entry[b] ^= keystream[i * 8 + b];
+				// Only XOR with keystream when runtime will undo it. Otherwise
+				// leave the table plaintext.
+				if (settings && settings->per_region_encryption) {
+					for (int b = 0; b < 8; b++) {
+						entry[b] ^= keystream[i * 8 + b];
+					}
 				}
 			}
 		}
@@ -346,7 +359,9 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 	a.mov(rsi, qword_ptr(rbx, table.perm_gp_off(vm_reg::VRCX)));
 
 	// --- Decrypt bytecode in-place with RC4 ---
-	if (key && key_size > 0 && bytecode_size > 0) {
+	// Only when per_region_encryption is on (otherwise the bytecode in the
+	// blob is already plaintext and running RC4 over it produces garbage).
+	if (key && key_size > 0 && bytecode_size > 0 && settings && settings->per_region_encryption) {
 		Label ksa_end = a.newLabel();
 		Label pra_loop = a.newLabel();
 		Label dec_done = a.newLabel();
@@ -685,6 +700,10 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 	//   4. `add rsp, 256` after the KSA without a matching `sub rsp, 256`
 	//      shifted RSP into the middle of the VM register file. Fix:
 	//      allocate properly with `sub rsp, 256` first.
+	// Only emit the runtime jt_table decrypt when encryption is on. If off,
+	// the post-process step below skips the XOR so the table is plaintext
+	// from the start and no runtime work is needed.
+	if (settings && settings->per_region_encryption)
 	{
 		Label jt_key = a.newLabel();
 		Label jt_skip_key = a.newLabel();
@@ -860,12 +879,11 @@ void vm_dispatcher::emit_mov_reg_mem_handler(x86::Assembler& a, handler_labels& 
 	a.jmp(addr_ready);
 	a.bind(has_base);
 	// User wrote [rsp+N]: translator emitted the permuted VRSP index here.
-	// We MUST use the real hardware RSP (where physical pushes actually wrote
-	// data), not the stored VRSP slot (which mirrors the user-visible rsp
-	// value but doesn't reflect the dispatcher's local frame offset).
+	// Compute as real_rsp + VM_FRAME_OFFSET so the address matches the
+	// user's logical view of their own stack. See VM_FRAME_OFFSET comment.
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(not_vrsp_base);
-	a.mov(rax, rsp);
+	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
 	a.jmp(do_add_disp);
 	a.bind(not_vrsp_base);
 	a.shl(rdx, 3);
@@ -929,10 +947,13 @@ void vm_dispatcher::emit_mov_mem_reg_handler(x86::Assembler& a, handler_labels& 
 	a.mov(rdi, rdx);
 	a.jmp(addr_ready);
 	a.bind(has_base);
-	// VRSP base -> use real RSP (see emit_mov_reg_mem_handler for rationale)
+	// VRSP base -> real RSP + VM_FRAME_OFFSET. The dispatcher's own frame
+	// sits between the user's logical RSP and the real hardware RSP. Using
+	// real RSP directly writes 480 bytes too low and corrupts the VM's
+	// own register file / saved regs.
 	a.cmp(cl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(mr_not_vrsp);
-	a.mov(rdi, rsp);
+	a.lea(rdi, qword_ptr(rsp, VM_FRAME_OFFSET));
 	a.jmp(mr_do_add_disp);
 	a.bind(mr_not_vrsp);
 	a.shl(rcx, 3);
@@ -1729,10 +1750,10 @@ void vm_dispatcher::emit_lea_handler(x86::Assembler& a, handler_labels& labels) 
 	a.mov(rax, r8);                                        // no base: addr = disp only
 	a.jmp(done);
 	a.bind(has_base);
-	// LEA base==VRSP -> real rsp (same as memory loads)
+	// LEA base==VRSP -> real RSP + VM_FRAME_OFFSET (user's logical rsp).
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(lea_base_not_vrsp);
-	a.mov(rax, rsp);
+	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
 	a.add(rax, r8);                                        // + disp
 	a.jmp(done);
 	a.bind(lea_base_not_vrsp);
@@ -2063,10 +2084,10 @@ void vm_dispatcher::emit_mov_reg_sib_handler(x86::Assembler& a, handler_labels& 
 	a.jne(has_base);
 	a.jmp(base_done);
 	a.bind(has_base);
-	// VRSP base -> real RSP (see emit_mov_reg_mem_handler rationale)
+	// VRSP base -> real RSP + VM_FRAME_OFFSET
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(sib_not_vrsp);
-	a.mov(rax, rsp);
+	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
 	a.jmp(base_done);
 	a.bind(sib_not_vrsp);
 	a.push(rdx);
@@ -2129,10 +2150,10 @@ void vm_dispatcher::emit_mov_sib_reg_handler(x86::Assembler& a, handler_labels& 
 	a.jne(has_base);
 	a.jmp(base_done);
 	a.bind(has_base);
-	// VRSP base -> real RSP
+	// VRSP base -> real RSP + VM_FRAME_OFFSET
 	a.cmp(cl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(sib2_not_vrsp);
-	a.mov(rdi, rsp);
+	a.lea(rdi, qword_ptr(rsp, VM_FRAME_OFFSET));
 	a.jmp(base_done);
 	a.bind(sib2_not_vrsp);
 	a.push(rcx);
@@ -2185,10 +2206,10 @@ void vm_dispatcher::emit_lea_sib_handler(x86::Assembler& a, handler_labels& labe
 	a.jne(has_base);
 	a.jmp(base_done);
 	a.bind(has_base);
-	// LEA SIB base==VRSP -> real rsp
+	// LEA SIB base==VRSP -> real RSP + VM_FRAME_OFFSET
 	a.cmp(dl, Imm(table.gp_perm[static_cast<int>(vm_reg::VRSP)]));
 	a.jne(lea_sib_not_vrsp);
-	a.mov(rax, rsp);
+	a.lea(rax, qword_ptr(rsp, VM_FRAME_OFFSET));
 	a.jmp(base_done);
 	a.bind(lea_sib_not_vrsp);
 	a.shl(rdx, 3);
