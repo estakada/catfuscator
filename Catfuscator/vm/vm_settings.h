@@ -41,44 +41,39 @@ struct vm_settings {
 		vm_settings s;
 		switch (profile) {
 		case vm_profile::OPTIMIZED:
-			// All noise knobs forced off pending VIRTUALIZE handler audit.
-			// Even MUTATE-side junk_frequency drives VM handler junk
-			// emission (emit_handler_entry_junk reads it) and turned out
-			// to be enough to corrupt stage 10's [rsp+disp] computations.
+			// Noise knobs (junk_frequency, opaque_predicate_pct, dead_branch_pct,
+			// opaque_constant_pct) still need handler-side cleanup: junk_block
+			// has more memory-writing variants to audit (cases 0 and 2 are fixed)
+			// and the constant-pollution chain in emit_mov_reg_imm64 is flaky on
+			// stage 10. Forced to 0 until the audit is done; the VIRTUALIZE-side
+			// protection knobs below are independently strong.
 			s.junk_frequency = 0;
 			s.dead_branch_pct = 0;
 			s.opaque_predicate_pct = 0;
 			s.opaque_constant_pct = 0;
 			s.mba_pct = 0;
 			s.chain_pct = 0;
-			// VIRTUALIZE-side toggles: temporarily forced off after the
-			// zero-stack-frame VM refactor. The translator-vs-handler
-			// invariants for these features were tuned against the OLD
-			// stack-frame layout and need to be re-validated against the
-			// new buffer-based ctx (TODO follow-up). With them all off
-			// stages 1-12 of test_takopi_cipher pass 60/60 across 5 trials.
-			s.handler_duplication = false;
-			s.dispatch_polymorphism = false;
-			s.encrypted_immediates = false;
-			s.per_region_encryption = false;
-			s.per_region_register_rename = false;
-			s.control_flow_flattening = false;
+			s.handler_duplication = true;
+			s.dispatch_polymorphism = false; // dead field, no implementation
+			s.encrypted_immediates = true;
+			s.per_region_encryption = true;
+			s.per_region_register_rename = true;
+			s.control_flow_flattening = true;
 			s.context_dependent_decoding = false;
 			break;
 		case vm_profile::ULTRA:
-			s.junk_frequency = 40;
-			s.dead_branch_pct = 10;
-			s.opaque_predicate_pct = 10;
-			s.opaque_constant_pct = 40;
+			s.junk_frequency = 0;       // See OPTIMIZED comment.
+			s.dead_branch_pct = 0;
+			s.opaque_predicate_pct = 0;
+			s.opaque_constant_pct = 0;
 			s.mba_pct = 15;
 			s.chain_pct = 20;
-			// See OPTIMIZED for why these are off pending follow-up.
-			s.handler_duplication = false;
+			s.handler_duplication = true;
 			s.dispatch_polymorphism = false;
-			s.encrypted_immediates = false;
-			s.per_region_encryption = false;
-			s.per_region_register_rename = false;
-			s.control_flow_flattening = false;
+			s.encrypted_immediates = true;
+			s.per_region_encryption = true;
+			s.per_region_register_rename = true;
+			s.control_flow_flattening = true;
 			s.context_dependent_decoding = false;
 			s.fake_cfg_edges = true;
 			s.fake_edge_pct = 15;

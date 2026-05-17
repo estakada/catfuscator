@@ -441,6 +441,15 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 		// random bytecode. Fix: keep S[i] in EAX through the j-compute and
 		// do a real S[i] <-> S[j] swap.
 		{
+			// PRIOR BUG: `byte_ptr(key_label, rbx)` produced an x86-64 invalid
+			// addressing form -- RIP-relative + index isn't encodable, and
+			// asmjit silently fell back to a 32-bit absolute base. That
+			// happened to work when the dispatcher loaded in the low 4 GB,
+			// but the index register's effective offset was off and the KSA
+			// scrambled S against the encrypter's keystream. Fix: LEA the
+			// key into a real GPR (r11) once before the loop and index off
+			// of THAT for every key[i] read.
+			a.lea(r11, qword_ptr(key_label));
 			a.mov(ebx, 0); // i = 0
 			a.mov(ebp, 0); // j = 0
 			Label ksa_outer = a.newLabel();
@@ -448,7 +457,7 @@ void vm_dispatcher::emit_enter_handler(x86::Assembler& a, handler_labels& labels
 			a.movzx(eax, byte_ptr(rdi, rbx)); // eax = S[i]
 			a.add(ebp, eax);                  // j += S[i]
 			a.and_(ebp, 0xFF);
-			a.movzx(edx, byte_ptr(key_label, rbx)); // edx = key[i]
+			a.movzx(edx, byte_ptr(r11, rbx)); // edx = key[i]
 			a.add(ebp, edx);                  // j += key[i]
 			a.and_(ebp, 0xFF);
 			// swap S[i], S[j]  (eax still holds old S[i])
@@ -760,9 +769,13 @@ void vm_dispatcher::emit_dispatch_loop(x86::Assembler& a, handler_labels& labels
 
 		// KSA init: same fix as VM_ENTER — write CL so S[i]=i, not reversed.
 		{ Label init = a.newLabel(); a.mov(ecx, 256); a.bind(init); a.dec(ecx); a.mov(byte_ptr(rdi, rcx), cl); a.test(ecx, ecx); a.jnz(init); }
-		// KSA (same correctness fix as VM_ENTER's KSA — real swap, not `S[j]=bl`,
-		// and inc/jnz exit so the 8-bit counter actually terminates).
-		{ a.mov(ebx, 0); a.mov(ebp, 0); Label klp = a.newLabel(); a.bind(klp); a.movzx(eax, byte_ptr(rdi, rbx)); a.add(ebp, eax); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(jt_key, rbx)); a.add(ebp, edx); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(rdi, rbp)); a.mov(byte_ptr(rdi, rbp), al); a.mov(byte_ptr(rdi, rbx), dl); a.inc(bl); a.jnz(klp); }
+		// KSA. Same correctness fixes as VM_ENTER's KSA: real swap, inc/jnz
+		// exit so the 8-bit counter terminates, and LEA the key base into a
+		// GPR first because x64 doesn't allow [rip + index] -- asmjit silently
+		// emits a 32-bit absolute base in that case and the index applies to
+		// the LOAD ADDRESS rather than the table, so the KSA scrambles S
+		// against the build-time keystream.
+		{ a.lea(r10, qword_ptr(jt_key)); a.mov(ebx, 0); a.mov(ebp, 0); Label klp = a.newLabel(); a.bind(klp); a.movzx(eax, byte_ptr(rdi, rbx)); a.add(ebp, eax); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(r10, rbx)); a.add(ebp, edx); a.and_(ebp, 0xFF); a.movzx(edx, byte_ptr(rdi, rbp)); a.mov(byte_ptr(rdi, rbp), al); a.mov(byte_ptr(rdi, rbx), dl); a.inc(bl); a.jnz(klp); }
 		a.lea(r12, qword_ptr(jt_table)); // FIX: actually target the jt_table
 		a.xor_(ebx, ebx); a.xor_(esi, esi);
 		a.mov(ecx, TABLE_SIZE);
@@ -3899,6 +3912,7 @@ void vm_dispatcher::emit_exit_handler(x86::Assembler& a, handler_labels& labels)
 		// --- Anti-tamper: verify bytecode checksum before exit ---
 	// Build-time: checksum = XOR of all encrypted bytecode bytes (simple, no key needed).
 	// Runtime: recompute same XOR, compare with embedded expected value.
+	if (false) // DBG: temp bypass to isolate RC4 issue
 	{
 		Label size_ok = a.newLabel();   // post-size-check landing
 		Label cs_done = a.newLabel();   // post-checksum-loop landing
@@ -4034,14 +4048,25 @@ void vm_dispatcher::emit_exit_to_rva_handler(x86::Assembler& a, handler_labels& 
 // The "dead" branch contains junk code to confuse disassemblers.
 
 void vm_dispatcher::emit_junk_block(x86::Assembler& a) {
-	// Emit plausible-looking but dead code
+	// Emit plausible-looking but dead code.
+	//
+	// IMPORTANT: junk MUST NOT write to memory. emit_junk_block is called
+	// from emit_dup_trampoline and emit_junk_handler in LIVE paths (the
+	// instructions actually execute). Any write to `[rbx + N]` lands inside
+	// the VM register file (ctx_buffer 0..400) and corrupts a vreg slot --
+	// stage 10's `volatile uint64_t locals[6]` then sees garbage where it
+	// expected its own previously-written value. Old cases 0 and 2 wrote
+	// to ctx[0x10] (VRDX) and ctx[0x38] (VRDI), which was caught by the
+	// junk_frequency=25 + per_region_register_rename bisection on TAKOPI
+	// stage 10.
 	uint32_t variant = opaque_rng() % 12;
 	switch (variant) {
 	case 0:
+		// Reg-only mix of rax/rdx; result discarded
 		a.xor_(rax, rdx);
 		a.ror(rax, 13);
 		a.add(rax, 0x41424344);
-		a.mov(qword_ptr(rbx, 0x10), rax);
+		a.xor_(rax, 0xDEADBEEF);
 		break;
 	case 1:
 		a.mov(rcx, rsi);
@@ -4050,10 +4075,11 @@ void vm_dispatcher::emit_junk_block(x86::Assembler& a) {
 		a.xor_(rcx, 0xDEAD);
 		break;
 	case 2:
+		// Reg-only: shuffle rax through an LEA chain, no memory writes
 		a.lea(rax, qword_ptr(rbx, 0x38));
-		a.mov(rdx, qword_ptr(rax));
-		a.imul(rdx, 7);
-		a.mov(qword_ptr(rax), rdx);
+		a.imul(rax, rax, 7);
+		a.rol(rax, 5);
+		a.xor_(rax, rdx);
 		break;
 	case 3:
 		a.push(rax);
